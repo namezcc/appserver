@@ -1,0 +1,9 @@
+{
+	"go.testFlags": [
+		"-v"
+	],
+	"go.lintFlags": [
+		"-checks",
+		"-ST1000"
+	]
+}

@@ -1,0 +1,55 @@
+package util
+
+const (
+	ST_GATE         = 0
+	ST_APP_SERVICE  = 1
+	ST_LOGIN        = 2
+	ST_MYSQL        = 3
+	ST_ROOM         = 8
+	ST_ROOM_MANAGER = 9
+	ST_LOGIN_LOCK   = 10
+	ST_LOGSERVER    = 11
+	ST_PUBLICK      = 13
+	ST_ADMIN_MGR    = 14
+	ST_ACCOUNT_ROLE = 15
+
+	ST_SERVICE_FIND   = 40
+	ST_MONITOR        = 41
+	ST_MASTER         = 42
+	ST_OPERATE        = 43
+	ST_LOGIN_SERVICE  = 101
+	ST_K8SERVICE      = 102
+	ST_CLIENT_SERVICE = 103
+)
+
+const (
+	MYSQL_TYPE_GAME    = 0
+	MYSQL_TYPE_ACCOUNT = 1
+	MYSQL_TYPE_MASTER  = 2
+)
+
+const (
+	SEX_WOMAN = 0
+	SEX_MAN   = 1
+)
+
+const (
+	MONEY_REWARD = 0
+	MONEY_COST   = 1
+)
+
+const (
+	TASK_STATE_NONE    = 0
+	TASK_STATE_BE_KICK = 1 //被踢
+	TASK_STATE_CANCEL  = 2 //解散
+)
+
+const (
+	ERRCODE_SUCCESS = iota
+	ERRCODE_ERROR
+	ERRCODE_PEOPLE_FULL       //人数已满
+	ERRCODE_TASK_OVER_ENDTIME //报名时间已过
+	ERRCODE_TASK_DELETE       //任务以取消
+	ERRCODE_TASK_HAVE_JOIN    //已经报名
+	ERRCODE_TASK_QUIT_ERROR   //退出失败
+)

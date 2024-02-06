@@ -1,0 +1,49 @@
+{
+	// See https://go.microsoft.com/fwlink/?LinkId=733558
+	// for the documentation about the tasks.json format
+	"version": "2.0.0",
+	"options": {
+		"cwd": "${workspaceFolder}/goserver/bin"
+	},
+	"problemMatcher": [],
+	"tasks": [
+		{
+			"label": "build service_find",
+			"type": "shell",
+			"command": "go build ../server/servicefind/service_find.go",
+		},
+		{
+			"label": "build monitor",
+			"type": "shell",
+			"command": "go build ../server/monitor/monitor.go",
+		},
+		{
+			"label": "build master",
+			"type": "shell",
+			"command": "go build ../server/master/master.go",
+		},
+		{
+			"label": "build clientService",
+			"type": "shell",
+			"command": "go build ../server/clientService/clientService.go",
+		},
+		{
+			"label": "build all",
+			"dependsOn":[
+				"build service_find",
+				"build monitor",
+				"build master",
+				"build clientService",
+			],
+			"dependsOrder": "sequence"
+		},
+		{
+			"label": "build linux",
+			"type": "shell",
+			"command": "./buildlinux.bat np",
+			"options": {
+				"cwd": "${workspaceFolder}/"
+			}
+		},
+	]
+}

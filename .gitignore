@@ -1,0 +1,6 @@
+goserver/vendor/
+goserver/bin/log/
+goserver/bin/upload/
+
+tmp.txt
+*.exe
