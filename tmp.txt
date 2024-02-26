@@ -1,0 +1,131 @@
+taskfile:
+	id:
+	cid:发布者id
+	creator_name:发布者名字
+	creator_icon:发布者头像
+	-- create_time:发布时间
+	title:标题
+	content:内容
+	images:[图片...]
+	-- reward:[奖励]
+	money_type:费用类型
+	money:报酬或任务费用
+	woman_money:女报酬或任务费用
+	people_num:总人数
+	man_num:男人数(-1:不分性别)
+	end_time:截止时间
+	position:任务地点
+
+{
+	"cid":0,
+	"creator_name":"",
+	"title":"",
+	"content":"",
+	"images":[],
+	"imagesUpload":[],
+	"money_type":0,
+	"money":0,
+	"womanMoney":0,
+	"people_num":0,
+	"man_num":0,
+	"end_time":0
+}
+
+{
+  "_id": {
+    "$oid": "6583d9c4ab8ebe31ab77b6a3"
+  },
+  "cid":109153824769,
+  "tasklist":[
+	{
+		"_id":{"$oid": "6583d9c4ab8ebe31ab77b6a3"},
+		"time": 0
+	},
+	{
+		"_id":{"$oid": "65840e6bab8ebe31ab77b6a5"},
+		"time": 0
+	},
+	{
+		"_id":{"$oid": "65840e7dab8ebe31ab77b6a7"},
+		"time": 0
+	}
+  ]
+}
+
+{
+  "_id": {
+    "$oid": "659b8bc95a472e32577448f9"
+  },
+  "cid":111,
+  "title":"2222",
+  "class":2
+}
+
+{
+	"num":1,
+	"join":[
+		{
+			"_id":111,
+			"name":"jack"
+		}
+	]
+}
+
+{
+	"cid":11,
+	"sendername":"a",
+	"sendericon":"a",
+	"send_time":111,
+	"content":"xx",
+	"content_type":0
+}
+
+#我发布的任务考虑放到一张表里存id
+#聊天 本地存储
+#图片压缩
+#聊天红点
+#完成任务发奖,领奖特效
+#支付服务费
+#领取服务费
+#领取奖励
+#完成之后退出不让
+#考虑换账号,存的数据按表名?还是数据库?
+#被踢设置个状态(算了不用)
+#任务解散,通知
+#新的聊天状态...
+#个人信息修改
+#浏览记录存本地好了
+#多图片展示还没做
+#举报内容,举报玩家
+#别的用户页面
+#任务聊天的删除
+#拉黑
+#搜索...
+#私聊
+#收藏?加入兴趣,上限100个
+#黑名单的各种限制
+#icon修改
+#用户创建随机名字和icon
+
+分享 #|到聊天?
+
+审核
+...
+支付
+成就,六边形等级
+设置标签?
+
+各种log
+
+聊天的红点
+
+加入任务的通知
+地图钉优化
+
+关注?
+好友?
+排队?
+被踢聊天的删除
+每天发布任务上限
+总的发布进行中任务上限
+用户信息本地存储?自己改变的信息 黑名单,兴趣, 等 (有问题,换机器后操作数据会变 ！！！)

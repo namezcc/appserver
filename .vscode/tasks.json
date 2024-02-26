@@ -28,6 +28,11 @@
 			"command": "go build ../server/clientService/clientService.go",
 		},
 		{
+			"label": "build appService",
+			"type": "shell",
+			"command": "go build ../server/appServer/appService.go",
+		},
+		{
 			"label": "build all",
 			"dependsOn":[
 				"build service_find",

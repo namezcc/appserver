@@ -13,11 +13,13 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/dgrijalva/jwt-go"
 	"github.com/gin-gonic/gin"
+	"github.com/go-ego/gse"
 	"github.com/go-redis/redis/v8"
 	"github.com/qiniu/qmgo"
 	qmoption "github.com/qiniu/qmgo/options"
@@ -33,6 +35,16 @@ const (
 	COLL_USER_TASK        = "user_task" //加入的任务
 	COLL_TASK_CHAT        = "task_chat"
 	COLL_USER_CREATE_TASK = "user_create_task" //创建的任务
+	COLL_REPORT_TASK      = "report_task"      //举报任务
+	COLL_REPORT_USER      = "report_user"      //举报用户
+	COLL_BLACK_LIST       = "black_list"       //黑名单
+	COLL_CHAT_USER        = "chat_user"        //私聊
+	COLL_USER_INTEREST    = "user_interest"    //收藏
+	COLL_APP_CRASH        = "app_crash"        //崩溃信息
+)
+
+const (
+	MAX_USER_INTEREST = 100
 )
 
 type jsonBase struct {
@@ -132,6 +144,8 @@ type AppLoginModule struct {
 	_userid_lock        sync.Mutex
 }
 
+var cutseg gse.Segmenter
+
 func (m *AppLoginModule) Init(mgr *moduleMgr) {
 	m.HttpModule.Init(mgr)
 	m._httpbase = m
@@ -141,6 +155,8 @@ func (m *AppLoginModule) Init(mgr *moduleMgr) {
 	m._sql_mgr = mgr.GetModule(MOD_MYSQL_MGR).(*MysqlManagerModule)
 	m._mg_mgr = mgr.GetModule(MOD_MONGO_MGR).(*MongoManagerModule)
 	m._server_mod = mgr.GetModule(MOD_CLIENT_SERVER).(*ClientServerModule)
+
+	cutseg.LoadDict("dict/t_1.txt, dict/s_1.txt")
 }
 
 func (m *AppLoginModule) BeforRun() {
@@ -206,6 +222,7 @@ func (m *AppLoginModule) initRoter(r *gin.Engine) {
 	m.safePost(r, "/userlogin", m.userLogin)
 
 	r.GET("/getUserInfo", m.apiGetUserInfo)
+	r.POST("/apiGetUserList", m.apiGetUserList)
 	r.GET("/userRefreshToken", m.userRefreshToken)
 	r.POST("/apiCreateTask", m.apiCreateTask)
 	r.POST("/apiUpdateTask", m.apiUpdateTask)
@@ -232,6 +249,24 @@ func (m *AppLoginModule) initRoter(r *gin.Engine) {
 
 	r.GET("/apiEditName", m.apiEditName)
 	r.GET("/apiEditSex", m.apiEditSex)
+	r.POST("/apiSetUserIcon", m.apiSetUserIcon)
+
+	r.POST("/apiReportTask", m.apiReportTask)
+	r.POST("/apiReportUser", m.apiReportUser)
+
+	r.GET("/apiPushBlackList", m.apiPushBlackList)
+	r.GET("/apiPullBlackList", m.apiPullBlackList)
+	r.GET("/apiGetBlackList", m.apiGetBlackList)
+
+	m.safePost(r, "/apiSearchTask", m.apiSearchTask)
+
+	r.GET("/apiTaskPushInterest", m.apiTaskPushInterest)
+	r.GET("/apiTaskPullInterest", m.apiTaskPullInterest)
+	r.GET("/apiLoadInterest", m.apiLoadInterest)
+	r.GET("/apiLoadInterestTask", m.apiLoadInterestTask)
+
+	m.safePost(r, "/apiAppCrash", m.apiAppCrash)
+
 }
 
 const UID_START_TIME = 1675612800
@@ -258,6 +293,7 @@ func (m *AppLoginModule) genUserId() int64 {
 
 func (m *AppLoginModule) ResponesJsonData(c *gin.Context, d interface{}) {
 	jd := jsonBase{
+		Code: util.ERRCODE_SUCCESS,
 		Data: d,
 	}
 	c.JSON(http.StatusOK, jd)
@@ -335,6 +371,18 @@ type userLoginData struct {
 	Code  string `json:"code"`
 }
 
+// 生成随机8个英文字符的字符串
+func generateRandomString() string {
+	// 定义包含所有可能字符的字符串
+	charset := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	// 生成8个随机字符
+	result := make([]byte, 8)
+	for i := range result {
+		result[i] = charset[rand.Intn(len(charset))]
+	}
+	return string(result)
+}
+
 func (m *AppLoginModule) userLogin(c *gin.Context) {
 	var info userLoginData
 	err := c.ShouldBindJSON(&info)
@@ -386,7 +434,7 @@ func (m *AppLoginModule) userLogin(c *gin.Context) {
 			if buser.Cid == 0 {
 				buser.Cid = m.genUserId()
 				buser.Phone = info.Phone
-				buser.Name = info.Phone
+				buser.Name = generateRandomString()
 				sqlres := d.Create(&buser)
 				if sqlres.Error != nil {
 					util.Log_error("create user error %s", sqlres.Error.Error())
@@ -406,7 +454,7 @@ func (m *AppLoginModule) userLogin(c *gin.Context) {
 			Phone:  info.Phone,
 		}
 		claims.IssuedAt = time.Now().Unix()
-		claims.ExpiresAt = time.Now().Add(time.Second * time.Duration(ExpireTime)).Unix()
+		claims.ExpiresAt = time.Now().Add(time.Second * time.Duration(AppExpireTime)).Unix()
 		signedToken, err := AppGetToken(claims)
 		if err != nil {
 			c.JSON(http.StatusOK, gin.H{"code": 1, "msg": err.Error()})
@@ -453,7 +501,13 @@ func (m *AppLoginModule) getUserInfo(cid int64, hashval uint32) *b_user {
 }
 
 func (m *AppLoginModule) apiGetUserInfo(c *gin.Context) {
-	cid := c.MustGet("userId").(int64)
+	strcid := c.DefaultQuery("cid", "")
+	cid := int64(0)
+	if len(strcid) == 0 {
+		cid = c.MustGet("userId").(int64)
+	} else {
+		cid = util.StringToInt64(strcid)
+	}
 	hashval := c.MustGet("phoneHash").(uint32)
 	buser := m.getUserInfo(cid, hashval)
 	if buser == nil {
@@ -461,6 +515,30 @@ func (m *AppLoginModule) apiGetUserInfo(c *gin.Context) {
 		return
 	}
 	m.ResponesJsonData(c, *buser)
+}
+
+type UserCidList struct {
+	Cids []int64 `json:"cids"`
+}
+
+func (m *AppLoginModule) apiGetUserList(c *gin.Context) {
+	var list UserCidList
+	err := c.ShouldBindJSON(&list)
+	if err != nil || len(list.Cids) == 0 {
+		util.Log_error("apiGetUserList 1 err:%s", err.Error())
+		m.ResponesError(c, util.ERRCODE_ERROR, "数据错误")
+		return
+	}
+
+	var users []b_user
+	m._sql_mgr.RequestFuncCall(func(d *gorm.DB) interface{} {
+		res := d.Select("cid", "name").Find(&users, list.Cids)
+		if res.Error != nil {
+			util.Log_error("apiGetUserList 2 err:%s", res.Error.Error())
+		}
+		return nil
+	})
+	m.ResponesJsonData(c, users)
 }
 
 type mg_location struct {
@@ -547,11 +625,13 @@ type mg_task_location struct {
 	Id       primitive.ObjectID `bson:"_id"`
 	Location mg_location        `bson:"location"`
 	UpdateAt time.Time          `bson:"updateAt"`
+	Title    string             `json:"title" bson:"title"`
 }
 
 type mg_task_globel struct {
 	Id       primitive.ObjectID `bson:"_id"`
 	UpdateAt time.Time          `bson:"updateAt"`
+	Title    string             `json:"title" bson:"title"`
 }
 
 type mg_task_join_info struct {
@@ -606,6 +686,15 @@ func checkTaskData(task *mg_task) bool {
 	return true
 }
 
+func checkInBlackList(qc *qmgo.QmgoClient, ctx context.Context, cid int64, blackcid int64) bool {
+	coll := qc.Database.Collection(COLL_BLACK_LIST)
+	n, err := coll.Find(ctx, bson.M{"cid": cid, "black": bson.M{"$in": bson.A{blackcid}}}).Count()
+	if err != nil {
+		util.Log_error("check in black err:%s", err.Error())
+	}
+	return n > 0
+}
+
 func (m *AppLoginModule) apiCreateTask(c *gin.Context) {
 	cid := c.MustGet("userId").(int64)
 	hashval := c.MustGet("phoneHash").(uint32)
@@ -633,6 +722,9 @@ func (m *AppLoginModule) apiCreateTask(c *gin.Context) {
 	// 过期时间
 	expireTime := task.EndTime - nowsec
 
+	worlds := cutseg.CutSearch(task.Title)
+	title := strings.Join(worlds, " ")
+
 	// 插入数据库
 	ires := m._mg_mgr.RequestFuncCallHash(hashval, func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
 		// 事务
@@ -643,6 +735,7 @@ func (m *AppLoginModule) apiCreateTask(c *gin.Context) {
 					Id:       task.Id,
 					Location: NewLocation(task.Address.Longitude, task.Address.Latitude),
 					UpdateAt: time.Now().Add(time.Second * time.Duration(expireTime)),
+					Title:    title,
 				}
 
 				coll := qc.Database.Collection("task_location")
@@ -655,6 +748,7 @@ func (m *AppLoginModule) apiCreateTask(c *gin.Context) {
 				taskglo := mg_task_globel{
 					Id:       task.Id,
 					UpdateAt: time.Now().Add(time.Second * time.Duration(expireTime)),
+					Title:    title,
 				}
 				coll := qc.Database.Collection("task_globel")
 				_, err := coll.InsertOne(sessCtx, taskglo)
@@ -762,6 +856,10 @@ func (m *AppLoginModule) apiUpdateTask(c *gin.Context) {
 	expireTime := task.EndTime - util.GetSecond()
 	exptime := time.Now().Add(time.Second * time.Duration(expireTime))
 	taskhash := util.StringHash(task.Id.String())
+
+	worlds := cutseg.CutSearch(task.Title)
+	title := strings.Join(worlds, " ")
+
 	// 更新
 	upopts := options.Update().SetUpsert(true)
 	qmopt := qmoption.UpdateOptions{UpdateHook: nil, UpdateOptions: upopts}
@@ -783,6 +881,7 @@ func (m *AppLoginModule) apiUpdateTask(c *gin.Context) {
 					taskglo := mg_task_globel{
 						Id:       task.Id,
 						UpdateAt: exptime,
+						Title:    title,
 					}
 					_, err = glo_coll.InsertOne(sessCtx, taskglo)
 					if err != nil {
@@ -799,7 +898,7 @@ func (m *AppLoginModule) apiUpdateTask(c *gin.Context) {
 					// 	UpdateAt: exptime,
 					// }
 					// err := loc_coll.ReplaceOne(sessCtx, bson.M{"_id": task.Id}, taskloc)
-					err := loc_coll.UpdateOne(sessCtx, bson.M{"_id": task.Id}, bson.M{"$set": bson.M{"location": loc, "updateAt": exptime}}, qmopt)
+					err := loc_coll.UpdateOne(sessCtx, bson.M{"_id": task.Id}, bson.M{"$set": bson.M{"location": loc, "updateAt": exptime, "title": title}}, qmopt)
 					if err != nil {
 						// 更新失败改插入
 						// _, err = loc_coll.InsertOne(sessCtx, taskloc)
@@ -816,6 +915,7 @@ func (m *AppLoginModule) apiUpdateTask(c *gin.Context) {
 					Id:       task.Id,
 					Location: NewLocation(task.Address.Longitude, task.Address.Latitude),
 					UpdateAt: exptime,
+					Title:    title,
 				}
 				_, err := loc_coll.InsertOne(sessCtx, taskloc)
 				if err != nil {
@@ -830,7 +930,7 @@ func (m *AppLoginModule) apiUpdateTask(c *gin.Context) {
 				// 	Id:       task.Id,
 				// 	UpdateAt: exptime,
 				// }
-				err = glo_coll.UpdateOne(sessCtx, bson.M{"_id": task.Id}, bson.M{"$set": bson.M{"updateAt": exptime}}, qmopt)
+				err = glo_coll.UpdateOne(sessCtx, bson.M{"_id": task.Id}, bson.M{"$set": bson.M{"updateAt": exptime, "title": title}}, qmopt)
 				if err != nil {
 					util.Log_error("replace task_globel err:%s", err.Error())
 					return nil, err
@@ -863,6 +963,7 @@ type taskGetConfig struct {
 	Loc_limit   int     `json:"loc_limit"`
 	GlobelMax   int     `json:"globelMax"`
 	LocMax      int     `json:"locMax"`
+	Search      string  `json:"search"`
 }
 
 type taskResult struct {
@@ -972,7 +1073,7 @@ func (m *AppLoginModule) apiGetTaskInfo(c *gin.Context) {
 				{Key: "as", Value: "result"},
 			},
 			},
-			bson.M{"$match": bson.M{"result": bson.D{{Key: "$ne", Value: bson.A{}}}}},
+			bson.M{"$match": bson.M{"result": bson.M{"$ne": bson.A{}}}},
 			bson.M{"$replaceRoot": bson.M{"newRoot": bson.M{"$arrayElemAt": bson.A{
 				"$result",
 				0,
@@ -1046,11 +1147,8 @@ func (m *AppLoginModule) apiGetOneTaskInfo(c *gin.Context) {
 	}
 }
 
-func (m *AppLoginModule) apiLoadMyTaskInfo(c *gin.Context) {
-	cid := c.MustGet("userId").(int64)
-	skip := util.StringToInt(c.DefaultQuery("skip", "0"))
-	neednum := 20
-	pipline := bson.A{
+func taskListToTaskPipline(cid int64, skip int, neednum int) bson.A {
+	return bson.A{
 		bson.M{"$match": bson.M{"cid": cid}},
 		bson.M{"$project": bson.M{"tasklist": bson.M{"$slice": bson.A{
 			"$tasklist",
@@ -1078,6 +1176,13 @@ func (m *AppLoginModule) apiLoadMyTaskInfo(c *gin.Context) {
 		},
 		bson.M{"$addFields": bson.M{"join": bson.M{"$arrayElemAt": bson.A{"$join", 0}}}},
 	}
+}
+
+func (m *AppLoginModule) apiLoadMyTaskInfo(c *gin.Context) {
+	cid := c.MustGet("userId").(int64)
+	skip := util.StringToInt(c.DefaultQuery("skip", "0"))
+	neednum := 20
+	pipline := taskListToTaskPipline(cid, skip, neednum)
 
 	var tasks []mg_task
 
@@ -1097,34 +1202,7 @@ func (m *AppLoginModule) apiLoadMyJoinTaskInfo(c *gin.Context) {
 	cid := c.MustGet("userId").(int64)
 	skip := util.StringToInt(c.DefaultQuery("skip", "0"))
 	neednum := 20
-	pipline := bson.A{
-		bson.M{"$match": bson.M{"cid": cid}},
-		bson.M{"$project": bson.M{"tasklist": bson.M{"$slice": bson.A{
-			"$tasklist",
-			-skip - neednum,
-			neednum,
-		},
-		},
-		},
-		},
-		bson.M{"$lookup": bson.D{
-			{Key: "from", Value: "task"},
-			{Key: "localField", Value: "tasklist._id"},
-			{Key: "foreignField", Value: "_id"},
-			{Key: "as", Value: "result"},
-		},
-		},
-		bson.M{"$unwind": "$result"},
-		bson.M{"$replaceRoot": bson.M{"newRoot": "$result"}},
-		bson.M{"$lookup": bson.D{
-			{Key: "from", Value: "task_join"},
-			{Key: "localField", Value: "_id"},
-			{Key: "foreignField", Value: "_id"},
-			{Key: "as", Value: "join"},
-		},
-		},
-		bson.M{"$addFields": bson.M{"join": bson.M{"$arrayElemAt": bson.A{"$join", 0}}}},
-	}
+	pipline := taskListToTaskPipline(cid, skip, neednum)
 
 	var tasklist []mg_task
 	m._mg_mgr.RequestFuncCall(func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
@@ -1251,9 +1329,14 @@ func (m *AppLoginModule) apiJoinTask(c *gin.Context) {
 			}
 		}
 		// 任务以取消
-		// if task.Delete > 0 {
-		// 	return util.ERRCODE_TASK_DELETE
-		// }
+		if task.Delete > 0 {
+			return util.ERRCODE_TASK_DELETE
+		}
+
+		// 是否黑名单
+		if checkInBlackList(qc, ctx, task.Cid, cid) {
+			return util.ERRCODE_IN_BLACK_LIST
+		}
 
 		nowsec := util.GetSecond()
 		// 报名时间已过
@@ -1945,4 +2028,415 @@ func (m *AppLoginModule) apiEditSex(c *gin.Context) {
 	} else {
 		m.ResponesError(c, util.ERRCODE_ERROR, "服务器错位")
 	}
+}
+
+type mg_report_task struct {
+	Submitcid int64    `json:"submitcid,omitempty" bson:"submitcid"`
+	Taskid    string   `json:"taskid" bson:"taskid"`
+	Type      int      `json:"type" bson:"type"`
+	Content   string   `json:"content" bson:"content"`
+	Images    []string `json:"images" bson:"images"`
+}
+
+type mg_report_user struct {
+	Submitcid int64    `json:"submitcid,omitempty" bson:"submitcid"`
+	Cid       int64    `json:"cid" bson:"cid"`
+	Type      int      `json:"type" bson:"type"`
+	Content   string   `json:"content" bson:"content"`
+	Images    []string `json:"images" bson:"images"`
+}
+
+func (m *AppLoginModule) apiReportTask(c *gin.Context) {
+	cid := c.MustGet("userId").(int64)
+	var reptask mg_report_task
+	err := c.ShouldBindJSON(&reptask)
+	if err != nil {
+		util.Log_error("apiReportTask json error:%s", err.Error())
+		m.ResponesError(c, 1, "输入数据错误")
+		return
+	}
+
+	if len(reptask.Images) > 3 {
+		util.Log_error("apiReportTask images len:%d", len(reptask.Images))
+		m.ResponesError(c, 1, "输入数据错误")
+		return
+	}
+
+	reptask.Submitcid = cid
+	// 存入mgdb
+	m._mg_mgr.RequestFuncCallNoRes(func(ctx context.Context, qc *qmgo.QmgoClient) {
+		coll := qc.Database.Collection(COLL_REPORT_TASK)
+		_, err := coll.InsertOne(ctx, reptask)
+		if err != nil {
+			util.Log_error("apiReportTask err:%s", err.Error())
+		}
+	})
+	m.ResponesJsonData(c, nil)
+}
+
+func (m *AppLoginModule) apiReportUser(c *gin.Context) {
+	cid := c.MustGet("userId").(int64)
+	var rep mg_report_user
+	err := c.ShouldBindJSON(&rep)
+	if err != nil {
+		util.Log_error("apiReportUser json error:%s", err.Error())
+		m.ResponesError(c, 1, "输入数据错误")
+		return
+	}
+
+	if len(rep.Images) > 3 {
+		util.Log_error("apiReportUser images len:%d", len(rep.Images))
+		m.ResponesError(c, 1, "输入数据错误")
+		return
+	}
+
+	rep.Submitcid = cid
+	// 存入mgdb
+	m._mg_mgr.RequestFuncCallNoRes(func(ctx context.Context, qc *qmgo.QmgoClient) {
+		coll := qc.Database.Collection(COLL_REPORT_USER)
+		_, err := coll.InsertOne(ctx, rep)
+		if err != nil {
+			util.Log_error("apiReportUser err:%s", err.Error())
+		}
+	})
+	m.ResponesJsonData(c, nil)
+}
+
+func (m *AppLoginModule) apiPushBlackList(c *gin.Context) {
+	cid := c.MustGet("userId").(int64)
+	strcid := c.DefaultQuery("cid", "")
+	blackcid := util.StringToInt64(strcid)
+	if blackcid <= 0 || blackcid == cid {
+		m.ResponesError(c, 1, "输入数据错误")
+		return
+	}
+	upopts := options.Update().SetUpsert(true)
+	qmopt := qmoption.UpdateOptions{UpdateHook: nil, UpdateOptions: upopts}
+	res := m._mg_mgr.RequestFuncCallHash(uint32(cid), func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
+		coll := qc.Database.Collection(COLL_BLACK_LIST)
+		err := coll.UpdateOne(ctx, bson.M{"cid": cid}, bson.M{"$addToSet": bson.M{"black": blackcid}}, qmopt)
+		if err != nil {
+			util.Log_error("push black err:%s", err.Error())
+			return false
+		}
+		return true
+	}).(bool)
+	if res {
+		m.ResponesJsonData(c, nil)
+	} else {
+		m.ResponesError(c, util.ERRCODE_ERROR, "服务器错误")
+	}
+}
+
+func (m *AppLoginModule) apiPullBlackList(c *gin.Context) {
+	cid := c.MustGet("userId").(int64)
+	strcid := c.DefaultQuery("cid", "")
+	blackcid := util.StringToInt64(strcid)
+	if blackcid <= 0 || blackcid == cid {
+		m.ResponesError(c, 1, "输入数据错误")
+		return
+	}
+	res := m._mg_mgr.RequestFuncCallHash(uint32(cid), func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
+		coll := qc.Database.Collection(COLL_BLACK_LIST)
+		err := coll.UpdateOne(ctx, bson.M{"cid": cid}, bson.M{"$pull": bson.M{"black": blackcid}})
+		if err != nil {
+			util.Log_error("pull black err:%s", err.Error())
+			return false
+		}
+		return true
+	}).(bool)
+	if res {
+		m.ResponesJsonData(c, nil)
+	} else {
+		m.ResponesError(c, util.ERRCODE_ERROR, "服务器错误")
+	}
+}
+
+type mg_black_list struct {
+	Id    primitive.ObjectID `json:"_id" bson:"_id"`
+	Cid   int64              `json:"cid" bson:"cid"`
+	Black []int64            `json:"black" bson:"black"`
+}
+
+func (m *AppLoginModule) apiGetBlackList(c *gin.Context) {
+	cid := c.MustGet("userId").(int64)
+	var res mg_black_list
+	m._mg_mgr.RequestFuncCallHash(uint32(cid), func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
+		coll := qc.Database.Collection(COLL_BLACK_LIST)
+		coll.Find(ctx, bson.M{"cid": cid}).One(&res)
+		return nil
+	})
+	m.ResponesJsonData(c, res.Black)
+}
+
+func getSearchPipline(search string, skip int, num int) bson.A {
+	return bson.A{
+		bson.M{"$match": bson.M{"$text": bson.M{"$search": search}}},
+		bson.M{"$skip": skip},
+		bson.M{"$limit": num},
+		bson.M{"$lookup": bson.D{
+			{Key: "from", Value: "task"},
+			{Key: "localField", Value: "_id"},
+			{Key: "foreignField", Value: "_id"},
+			{Key: "as", Value: "result"},
+		},
+		},
+		// bson.M{"$match": bson.M{"result": bson.M{"$ne": bson.A{}}}},
+		bson.M{"$replaceRoot": bson.M{"newRoot": bson.M{"$arrayElemAt": bson.A{
+			"$result",
+			0,
+		},
+		},
+		},
+		},
+		bson.M{"$lookup": bson.D{
+			{Key: "from", Value: "task_join"},
+			{Key: "localField", Value: "_id"},
+			{Key: "foreignField", Value: "_id"},
+			{Key: "as", Value: "join"},
+		},
+		},
+		bson.M{"$addFields": bson.M{"join": bson.M{"$arrayElemAt": bson.A{"$join", 0}}}},
+	}
+}
+
+func (m *AppLoginModule) apiSearchTask(c *gin.Context) {
+	var taskconf taskGetConfig
+	err := c.ShouldBindJSON(&taskconf)
+	if err != nil || len(taskconf.Search) == 0 {
+		util.Log_error(err.Error())
+		m.ResponesError(c, 1, "数据错误")
+		return
+	}
+
+	taskResult := taskResult{
+		Config: &taskconf,
+		Data:   []mg_task{},
+	}
+	if taskconf.LocMax > 0 && taskconf.GlobelMax > 0 {
+		m.ResponesJsonData(c, taskResult)
+		return
+	}
+
+	neednum := 20
+	// 区域查找
+	if taskconf.LocMax == 0 {
+		pipline := getSearchPipline(taskconf.Search, taskconf.Loc_limit, neednum)
+		res := m._mg_mgr.RequestFuncCall(func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
+			coll := qc.Database.Collection("task_location")
+			err := coll.Aggregate(ctx, pipline).All(&taskResult.Data)
+			if err != nil {
+				util.Log_error("search task err:%s", err.Error())
+				return false
+			}
+			return true
+		}).(bool)
+		if res == false {
+			m.ResponesError(c, 1, "查找失败task")
+			return
+		}
+		getlen := len(taskResult.Data)
+		taskconf.Loc_limit += getlen
+		if getlen <= 0 {
+			taskconf.LocMax = 1
+		}
+	}
+
+	if taskconf.GlobelMax == 0 {
+		var globeldata []mg_task
+		pipline := getSearchPipline(taskconf.Search, taskconf.GlobelLimit, neednum)
+		res := m._mg_mgr.RequestFuncCall(func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
+			coll := qc.Database.Collection("task_globel")
+			err := coll.Aggregate(ctx, pipline).All(&globeldata)
+			if err != nil {
+				util.Log_error("search task_globel err:%s", err.Error())
+				return false
+			}
+			return true
+		}).(bool)
+		if res == false {
+			m.ResponesError(c, 1, "查找失败task_globel")
+			return
+		}
+		getlen := len(globeldata)
+		if getlen > 0 {
+			taskResult.Data = append(taskResult.Data, globeldata...)
+			taskconf.GlobelLimit += getlen
+		}
+		if getlen <= 0 {
+			taskconf.GlobelMax = 1
+		}
+	}
+	m.ResponesJsonData(c, taskResult)
+}
+
+type mg_user_interest struct {
+	Id   primitive.ObjectID   `json:"_id" bson:"_id"`
+	Cid  int64                `json:"cid" bson:"cid"`
+	Data []primitive.ObjectID `json:"tasklist" bson:"tasklist"`
+}
+
+type mg_array_size struct {
+	ArraySize int `json:"arraysize" bson:"arraysize"`
+}
+
+func (m *AppLoginModule) apiTaskPushInterest(c *gin.Context) {
+	cid := c.MustGet("userId").(int64)
+	taskid := c.DefaultQuery("taskid", "")
+	if len(taskid) == 0 {
+		m.ResponesError(c, 1, "输入数据错误")
+		return
+	}
+
+	objid := taskIdToObjectId(taskid)
+	if objid == nil {
+		m.ResponesError(c, 1, "输入数据错误")
+		return
+	}
+
+	upopts := options.Update().SetUpsert(true)
+	qmopt := qmoption.UpdateOptions{UpdateHook: nil, UpdateOptions: upopts}
+	code := m._mg_mgr.RequestFuncCallHash(uint32(cid), func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
+		coll := qc.Database.Collection(COLL_USER_INTEREST)
+		var arrsize mg_array_size
+		coll.Find(ctx, bson.M{"cid": cid}).Select(bson.M{"arraysize": bson.M{"$size": "$tasklist"}}).One(&arrsize)
+		if arrsize.ArraySize >= MAX_USER_INTEREST {
+			return util.ERRCODE_MAX_USER_INTEREST
+		}
+		err := coll.UpdateOne(ctx, bson.M{"cid": cid}, bson.M{"$addToSet": bson.M{"tasklist": objid}}, qmopt)
+		if err != nil {
+			util.Log_error("push interest err:%s", err.Error())
+			return util.ERRCODE_ERROR
+		}
+		return util.ERRCODE_SUCCESS
+	}).(int)
+
+	m.ResponesError(c, code, "")
+}
+
+func (m *AppLoginModule) apiTaskPullInterest(c *gin.Context) {
+	cid := c.MustGet("userId").(int64)
+	taskid := c.DefaultQuery("taskid", "")
+	if len(taskid) == 0 {
+		m.ResponesError(c, 1, "输入数据错误")
+		return
+	}
+
+	objid := taskIdToObjectId(taskid)
+	if objid == nil {
+		m.ResponesError(c, 1, "输入数据错误")
+		return
+	}
+
+	m._mg_mgr.RequestFuncCallNoResHash(uint32(cid), func(ctx context.Context, qc *qmgo.QmgoClient) {
+		coll := qc.Database.Collection(COLL_USER_INTEREST)
+		err := coll.UpdateOne(ctx, bson.M{"cid": cid}, bson.M{"$pull": bson.M{"tasklist": objid}})
+		if err != nil {
+			util.Log_error("pull interest err:%s", err.Error())
+		}
+	})
+	m.ResponesJsonData(c, nil)
+}
+
+func (m *AppLoginModule) apiLoadInterest(c *gin.Context) {
+	cid := c.MustGet("userId").(int64)
+	var interest mg_user_interest
+	m._mg_mgr.RequestFuncCall(func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
+		coll := qc.Database.Collection(COLL_USER_INTEREST)
+		coll.Find(ctx, bson.M{"cid": cid}).One(&interest)
+		return nil
+	})
+	m.ResponesJsonData(c, interest.Data)
+}
+
+func (m *AppLoginModule) apiLoadInterestTask(c *gin.Context) {
+	cid := c.MustGet("userId").(int64)
+	skip := util.StringToInt(c.DefaultQuery("skip", "0"))
+
+	neednum := 20
+	pipline := bson.A{
+		bson.M{"$match": bson.M{"cid": cid}},
+		bson.M{"$project": bson.M{"tasklist": bson.M{"$slice": bson.A{
+			"$tasklist",
+			-skip - neednum,
+			neednum,
+		},
+		},
+		},
+		},
+		bson.M{"$lookup": bson.D{
+			{Key: "from", Value: "task"},
+			{Key: "localField", Value: "tasklist"},
+			{Key: "foreignField", Value: "_id"},
+			{Key: "as", Value: "result"},
+		},
+		},
+		bson.M{"$unwind": "$result"},
+		bson.M{"$replaceRoot": bson.M{"newRoot": "$result"}},
+		bson.M{"$lookup": bson.D{
+			{Key: "from", Value: "task_join"},
+			{Key: "localField", Value: "_id"},
+			{Key: "foreignField", Value: "_id"},
+			{Key: "as", Value: "join"},
+		},
+		},
+		bson.M{"$addFields": bson.M{"join": bson.M{"$arrayElemAt": bson.A{"$join", 0}}}},
+	}
+
+	var tasklist []mg_task
+	m._mg_mgr.RequestFuncCall(func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
+		coll := qc.Database.Collection(COLL_USER_INTEREST)
+		err := coll.Aggregate(ctx, pipline).All(&tasklist)
+		if err != nil {
+			util.Log_error("load interest task err:%s", err.Error())
+			return false
+		}
+		return true
+	})
+	m.ResponesJsonData(c, tasklist)
+}
+
+func (m *AppLoginModule) apiSetUserIcon(c *gin.Context) {
+	cid := c.MustGet("userId").(int64)
+	iconurl := c.PostForm("icon")
+	if len(iconurl) == 0 {
+		m.ResponesError(c, 1, "输入数据错误")
+		return
+	}
+
+	res := m._sql_mgr.RequestFuncCall(func(d *gorm.DB) interface{} {
+		r := d.Model(&b_user{Cid: cid}).Update("icon", iconurl)
+		if r.Error != nil {
+			util.Log_error("apiSetIcon %s", r.Error.Error())
+			return false
+		}
+		return true
+	}).(bool)
+	if res {
+		m.ResponesError(c, util.ERRCODE_SUCCESS, "设置成功")
+	} else {
+		m.ResponesError(c, util.ERRCODE_ERROR, "设置失败")
+	}
+}
+
+type mg_app_crash struct {
+	Id    primitive.ObjectID `json:"_id" bson:"_id"`
+	Crash string             `json:"crash" bson:"crash"`
+}
+
+func (m *AppLoginModule) apiAppCrash(c *gin.Context) {
+	info := c.PostForm("crash")
+
+	crash := mg_app_crash{
+		Id:    qmgo.NewObjectID(),
+		Crash: info,
+	}
+
+	m._mg_mgr.RequestFuncCallNoRes(func(ctx context.Context, qc *qmgo.QmgoClient) {
+		coll := qc.Database.Collection(COLL_APP_CRASH)
+		_, err := coll.InsertOne(ctx, crash)
+		if err != nil {
+			util.Log_error(err.Error())
+		}
+	})
 }

@@ -47,9 +47,11 @@ const (
 const (
 	ERRCODE_SUCCESS = iota
 	ERRCODE_ERROR
-	ERRCODE_PEOPLE_FULL       //人数已满
-	ERRCODE_TASK_OVER_ENDTIME //报名时间已过
-	ERRCODE_TASK_DELETE       //任务以取消
-	ERRCODE_TASK_HAVE_JOIN    //已经报名
-	ERRCODE_TASK_QUIT_ERROR   //退出失败
+	ERRCODE_PEOPLE_FULL           //人数已满
+	ERRCODE_TASK_OVER_ENDTIME     //报名时间已过
+	ERRCODE_TASK_DELETE           //任务以取消
+	ERRCODE_TASK_HAVE_JOIN        //已经报名
+	ERRCODE_TASK_QUIT_ERROR       //退出失败
+	ERRCODE_IN_BLACK_LIST     = 7 //被拉黑名单
+	ERRCODE_MAX_USER_INTEREST = 8 //收藏已满
 )

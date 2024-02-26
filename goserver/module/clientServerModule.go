@@ -16,12 +16,13 @@ import (
 )
 
 const PING_OUT_TIME = 300    //30
-const MAX_TASK_TALK_NUM = 15 //保留1000条聊天,>=2倍则删除一半
+const MAX_TASK_TALK_NUM = 15 //保留500条聊天,>=2倍则删除一半
 
 const (
 	CHAT_TYPE_BEGIN = iota
 	CHAT_TYPE_TEXT
 	CHAT_TYPE_IMAGE
+	CHAT_TYPE_TASK
 	CHAT_TYPE_END
 )
 
@@ -84,6 +85,8 @@ func (m *ClientServerModule) Init(mgr *moduleMgr) {
 	handle.Handlemsg.AddMsgCall(handle.N_CM_LOAD_TASK_CHAT, m.onGetOneTaskChat)
 	handle.Handlemsg.AddMsgCall(handle.N_CM_TASK_CHAT_READ, m.onTaskChatRead)
 
+	handle.Handlemsg.AddMsgCall(handle.N_CM_CHAT_USER, m.onClientChatUser)
+	handle.Handlemsg.AddMsgCall(handle.N_CM_CHAT_USER_GET, m.onClientChatUserGet)
 }
 
 func (m *ClientServerModule) AfterInit() {
@@ -227,6 +230,7 @@ func (m *ClientServerModule) onClientLogin(msg *handle.BaseMsg) {
 	m.addUser(&user)
 	m.sendUserTaskChatIndex(&user)
 	m.sendUserTaskChatRead(&user)
+	m.loadUserChat(&user)
 	util.Log_info("app user login connid:%d cid:%d phone:%s", user.connid, user.cid, user.Phone)
 }
 
@@ -294,7 +298,7 @@ func (m *ClientServerModule) broadClientJson(connid []int, msgid int, d interfac
 	m._net.BroadPackMsg(connid, msgid, pack)
 }
 
-type mg_chat struct {
+type Mg_chat struct {
 	Cid         int64  `json:"cid,omitempty" bson:"cid"`
 	Sendername  string `json:"sendername,omitempty" bson:"sendername"`
 	Sendericon  string `json:"sendericon,omitempty" bson:"sendericon"`
@@ -307,10 +311,16 @@ type mg_chat struct {
 type mg_task_chat struct {
 	Id     primitive.ObjectID `json:"id" bson:"_id"`
 	Cid    int64              `json:"cid" bson:"cid"`
-	Data   []mg_chat          `json:"data,omitempty" bson:"data,omitempty"`
+	Data   []Mg_chat          `json:"data,omitempty" bson:"data,omitempty"`
 	Count  int                `json:"count" bson:"count"`
 	Index  int                `json:"index" bson:"index"`
 	Delete int                `json:"delete" bson:"delete"`
+}
+
+type mg_chat_user struct {
+	Mg_chat `json:",inline" bson:",inline"`
+	Tocid   int64 `json:"tocid" bson:"tocid"`
+	Chatid  int64 `json:"chatid,omitempty" bson:"chatid"`
 }
 
 func (m *ClientServerModule) getTaskJoin(taskid primitive.ObjectID, cid int64, mastercid int64) *mg_task_join {
@@ -407,7 +417,7 @@ func (m *ClientServerModule) getTaskChat(taskid primitive.ObjectID) *mg_task_cha
 	return c
 }
 
-func (m *ClientServerModule) insertTaskChat(c *mg_chat, tc *mg_task_chat) bool {
+func (m *ClientServerModule) insertTaskChat(c *Mg_chat, tc *mg_task_chat) bool {
 	// 更新
 	tc.Count++
 	tc.Index++
@@ -479,7 +489,7 @@ func (m *ClientServerModule) onClientTaskChat(msg *handle.BaseMsg) {
 	chat.Sendername = user.user.Name
 	chat.Sendericon = user.user.Icon
 	chat.Index = taskchat.Index
-	taskchat.Data = []mg_chat{chat}
+	taskchat.Data = []Mg_chat{chat}
 	res := m.insertTaskChat(&chat, taskchat)
 	if res == false {
 		m.sendClientMsgError(um.msg.ConnId(), handle.N_CM_TASK_CHAT, util.ERRCODE_ERROR, "insert taskchat fail")
@@ -659,5 +669,85 @@ func (m *ClientServerModule) onDeleteTaskChatRead(msg *handle.BaseMsg) {
 		if res.Error != nil {
 			util.Log_error("delete task read %s", res.Error.Error())
 		}
+	})
+}
+
+func (m *ClientServerModule) onClientChatUser(msg *handle.BaseMsg) {
+	um := msg.Data.(*userMsg)
+	// json
+	var chat mg_chat_user
+	err := json.Unmarshal(um.msg.ReadBuff(), &chat)
+	if err != nil {
+		util.Log_error("chat user err:%s", err.Error())
+		return
+	}
+
+	if chat.ContentType <= CHAT_TYPE_BEGIN || chat.ContentType >= CHAT_TYPE_END || len(chat.Content) > 1000 ||
+		chat.Tocid <= 0 {
+		return
+	}
+
+	user := um.user
+	chat.Cid = user.cid
+	chat.SendTime = util.GetSecond()
+	chat.Sendername = user.user.Name
+	chat.Sendericon = user.user.Icon
+	repid := chat.Chatid
+	chat.Chatid = util.GetMillisecond()
+
+	// 插入数据库
+	res := m._mg_mgr.RequestFuncCall(func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
+		// 是否黑名单
+		if checkInBlackList(qc, ctx, chat.Tocid, user.cid) {
+			return false
+		}
+
+		coll := qc.Database.Collection(COLL_CHAT_USER)
+		_, err := coll.InsertOne(ctx, chat)
+		if err != nil {
+			util.Log_error("user chat err:%s", err.Error())
+		}
+		return true
+	}).(bool)
+
+	if res {
+		// 同步
+		touser := m.getUserByCid(chat.Tocid)
+		if touser != nil {
+			m.sendClientJson(touser.connid, handle.SM_CHAT_USER, []mg_chat_user{chat})
+		}
+	}
+	pack := network.NewMsgPackDef()
+	pack.WriteInt64(chat.Tocid)
+	pack.WriteInt64(um.user.cid)
+	pack.WriteInt64(repid)
+	pack.WriteInt64(chat.Chatid)
+	m.sendClientPack(um.user.connid, handle.SM_CHAT_USER_GET, pack)
+}
+
+func (m *ClientServerModule) loadUserChat(user *appUserInfo) {
+	var chats []mg_chat_user
+	m._mg_mgr.RequestFuncCall(func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
+		coll := qc.Database.Collection(COLL_CHAT_USER)
+		err := coll.Find(ctx, bson.M{"tocid": user.cid}).All(&chats)
+		if err != nil {
+			util.Log_error("load user chat err:%s", err.Error())
+		}
+		return nil
+	})
+	if len(chats) > 0 {
+		m.sendClientJson(user.connid, handle.SM_CHAT_USER, chats)
+	}
+}
+
+func (m *ClientServerModule) onClientChatUserGet(msg *handle.BaseMsg) {
+	um := msg.Data.(*userMsg)
+
+	lowid := um.msg.ReadInt64()
+	heighid := um.msg.ReadInt64()
+
+	m._mg_mgr.RequestFuncCallNoRes(func(ctx context.Context, qc *qmgo.QmgoClient) {
+		coll := qc.Database.Collection(COLL_CHAT_USER)
+		coll.RemoveAll(ctx, bson.M{"tocid": um.user.cid, "chatid": bson.M{"$gte": lowid, "$lte": heighid}})
 	})
 }
