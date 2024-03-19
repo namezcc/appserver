@@ -7,8 +7,10 @@ import (
 	"goserver/network"
 	"goserver/util"
 	"net"
+	"net/http"
 	"time"
 
+	"github.com/gobwas/ws"
 	"github.com/qiniu/qmgo"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -46,6 +48,7 @@ type ClientServerModule struct {
 	modulebase
 	_net                  *netModule
 	_host                 string
+	_host_ws              string
 	_user                 map[int]*appUserInfo
 	_user_cid             map[int64]*appUserInfo
 	_user_ping_order_list *util.ListOrder
@@ -64,6 +67,7 @@ func sortUserPing(a, b interface{}) bool {
 func (m *ClientServerModule) Init(mgr *moduleMgr) {
 	m._mod_mgr = mgr
 	m._host = util.GetConfValue("serverhost")
+	m._host_ws = util.GetConfValue("serverhostws")
 	m._user = make(map[int]*appUserInfo)
 	m._user_cid = make(map[int64]*appUserInfo)
 	m._user_ping_order_list = util.NewListOrder(sortUserPing)
@@ -93,6 +97,10 @@ func (m *ClientServerModule) AfterInit() {
 	m._net = ModuleMgr.GetModule(MOD_NET).(*netModule)
 	if len(m._host) > 0 {
 		m.startListen()
+	}
+
+	if len(m._host_ws) > 0 {
+		m.startListenWs()
 	}
 
 	m.setTikerFunc(time.Second*5, m.onCheckPingTime)
@@ -157,8 +165,28 @@ func (m *ClientServerModule) startListen() {
 				util.Log_error(err.Error())
 			} else {
 				util.Log_info("accept conn %s", conn.RemoteAddr().String())
-				m._net.AcceptConn(conn, m.onReadClientMsg)
+				m._net.AcceptConn(conn, m.onReadClientMsg, false)
 			}
+		}
+	}()
+}
+
+func (m *ClientServerModule) startListenWs() {
+	go func() {
+		util.Log_info("start listen ws:%s", m._host_ws)
+		err := http.ListenAndServe(m._host_ws, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			conn, _, _, err := ws.UpgradeHTTP(r, w)
+			if err != nil {
+				util.Log_error(err.Error())
+				return
+			} else {
+				util.Log_info("accept websocket conn %s", conn.RemoteAddr().String())
+			}
+			// conn.Close()
+			m._net.AcceptConn(conn, m.onReadClientMsg, true)
+		}))
+		if err != nil {
+			util.Log_error(err.Error())
 		}
 	}()
 }
@@ -262,7 +290,7 @@ func (m *ClientServerModule) sendClientPack(connid int, msgid int, p *network.Ms
 	m._net.SendPackMsg(connid, msgid, p)
 }
 func (m *ClientServerModule) sendClientMsgError(connid int, msgid int, code int, msg string) {
-	d, err := json.Marshal(MH{"code": code, "msg": msg})
+	d, err := json.Marshal(MH{"code": code, "msg": msg, "msgid": msgid})
 	if err != nil {
 		util.Log_error("sendclientmsgError: %s", err.Error())
 		return
@@ -321,6 +349,16 @@ type mg_chat_user struct {
 	Mg_chat `json:",inline" bson:",inline"`
 	Tocid   int64 `json:"tocid" bson:"tocid"`
 	Chatid  int64 `json:"chatid,omitempty" bson:"chatid"`
+}
+
+type mg_chat_user_list struct {
+	Id       primitive.ObjectID `json:"id" bson:"_id"`
+	Cidhei   int64              `json:"cidhei" bson:"cidhei"`
+	Cidlow   int64              `json:"cidlow" bson:"cidlow"`
+	Data     []Mg_chat          `json:"data,omitempty" bson:"data,omitempty"`
+	Count    int                `json:"count" bson:"count"`
+	Indexid  int                `json:"indexid" bson:"indexid"`
+	UpdateAt int64              `json:"updateat" bson:"updateat"`
 }
 
 func (m *ClientServerModule) getTaskJoin(taskid primitive.ObjectID, cid int64, mastercid int64) *mg_task_join {
@@ -545,7 +583,7 @@ func (m *ClientServerModule) onGetOneTaskChat(msg *handle.BaseMsg) {
 		return
 	}
 
-	taskid := taskIdToObjectId(string(taskstrid))
+	taskid := stringToObjectId(string(taskstrid))
 	if taskid == nil {
 		return
 	}
@@ -710,19 +748,73 @@ func (m *ClientServerModule) onClientChatUser(msg *handle.BaseMsg) {
 		return true
 	}).(bool)
 
+	uchat := Mg_chat{
+		Cid:         user.cid,
+		Sendername:  user.user.Name,
+		Sendericon:  user.user.Icon,
+		SendTime:    chat.SendTime,
+		Content:     chat.Content,
+		ContentType: chat.ContentType,
+	}
+
+	cidhei := user.cid
+	cidlow := chat.Tocid
+	if chat.Tocid > user.cid {
+		cidhei = chat.Tocid
+		cidlow = user.cid
+	}
+	// user chat list
+	chatlist := mg_chat_user_list{
+		Cidhei:   cidhei,
+		Cidlow:   cidlow,
+		UpdateAt: uchat.SendTime,
+	}
+	m._mg_mgr.RequestFuncCall(func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
+		coll := qc.Database.Collection(COLL_CHAT_USER_LIST)
+		coll.Find(ctx, bson.M{"cidhei": cidhei, "cidlow": cidlow}).Select(bson.M{"_id": 1, "count": 1, "indexid": 1}).One(&chatlist)
+
+		uchat.Index = chatlist.Indexid
+		chatlist.Indexid++
+		chatlist.Count++
+		chatlist.Data = append(chatlist.Data, uchat)
+		if chatlist.Id.IsZero() {
+			chatlist.Id = qmgo.NewObjectID()
+			// 插入
+			_, err := coll.InsertOne(ctx, chatlist)
+			if err != nil {
+				util.Log_error("insert chat user list err:%s", err.Error())
+			}
+		} else {
+			// 更新
+			err := coll.UpdateOne(ctx, bson.M{"_id": chatlist.Id}, bson.M{"$set": bson.M{"indexid": chatlist.Indexid, "count": chatlist.Count}, "$push": bson.M{"data": uchat}})
+			if err != nil {
+				util.Log_error("insert chat user list err:%s", err.Error())
+			}
+		}
+		// 删除旧的记录
+		if chatlist.Count >= 200 {
+
+		}
+		return true
+	})
+
 	if res {
 		// 同步
 		touser := m.getUserByCid(chat.Tocid)
 		if touser != nil {
 			m.sendClientJson(touser.connid, handle.SM_CHAT_USER, []mg_chat_user{chat})
+			m.sendClientJson(touser.connid, handle.SM_CHAT_USER_LIST, chatlist)
 		}
 	}
+
 	pack := network.NewMsgPackDef()
 	pack.WriteInt64(chat.Tocid)
 	pack.WriteInt64(um.user.cid)
 	pack.WriteInt64(repid)
 	pack.WriteInt64(chat.Chatid)
 	m.sendClientPack(um.user.connid, handle.SM_CHAT_USER_GET, pack)
+
+	m.sendClientJson(um.user.connid, handle.SM_CHAT_USER_LIST, chatlist)
 }
 
 func (m *ClientServerModule) loadUserChat(user *appUserInfo) {

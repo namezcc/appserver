@@ -10,6 +10,16 @@ const (
 	CONN_STATE_DISCONNECT = -1
 )
 
+type connI interface {
+	StartRead(ReadCallBack)
+	Write(b []byte)
+	Close()
+	GetConnType() int
+	SetUserData(ud interface{})
+	GetUserData() interface{}
+	GetConnId() int
+}
+
 type Tcpconn struct {
 	_conn     net.Conn
 	_sendchan chan []byte

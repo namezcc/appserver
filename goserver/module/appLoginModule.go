@@ -25,6 +25,7 @@ import (
 	qmoption "github.com/qiniu/qmgo/options"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"gorm.io/gorm"
 )
@@ -41,11 +42,19 @@ const (
 	COLL_CHAT_USER        = "chat_user"        //私聊
 	COLL_USER_INTEREST    = "user_interest"    //收藏
 	COLL_APP_CRASH        = "app_crash"        //崩溃信息
+	COLL_TASK_CHECK       = "task_check"       //审核中
+	COLL_TASK_GLOBEL      = "task_globel"      //全服任务
+	COLL_TASK_LOCATION    = "task_location"    //本地任务
+	COLL_CHAT_USER_LIST   = "chat_user_list"   //聊天缓存
 )
 
 const (
 	MAX_USER_INTEREST = 100
 )
+
+type JsonStringList struct {
+	Data []string `json:"data"`
+}
 
 type jsonBase struct {
 	Code int         `json:"code"`
@@ -131,6 +140,72 @@ func AppGetToken(claims *AppJWTClaims) (signedToken string, err error) {
 	return signedToken, nil
 }
 
+func createOfficialMongoClient() *mongo.Client {
+	host := util.GetConfValue("mongo-host")
+	client, err := mongo.Connect(context.Background(), options.Client().ApplyURI(host))
+	if err != nil {
+		panic(err)
+	}
+	return client
+}
+
+func creatCollIndex(cli *mongo.Client, collname string, models []mongo.IndexModel) {
+	coll := cli.Database("test").Collection(collname)
+	_, err := coll.Indexes().CreateMany(context.Background(), models)
+	if err != nil {
+		util.Log_error("createIndex coll:%s err:%s", collname, err.Error())
+	}
+}
+
+// 初始化索引
+func initCollIndex() {
+	cli := createOfficialMongoClient()
+	// black_list
+	indexs := []mongo.IndexModel{
+		{Keys: bson.D{{Key: "cid", Value: 1}}},
+	}
+	creatCollIndex(cli, COLL_BLACK_LIST, indexs)
+	// chat_user
+	indexs = []mongo.IndexModel{
+		{Keys: bson.D{{Key: "tocid", Value: 1}}},
+	}
+	creatCollIndex(cli, COLL_CHAT_USER, indexs)
+	// chat_user_list
+	indexs = []mongo.IndexModel{
+		{Keys: bson.D{{Key: "cidhei", Value: 1}}},
+		{Keys: bson.D{{Key: "cidlow", Value: 1}}},
+	}
+	creatCollIndex(cli, COLL_CHAT_USER_LIST, indexs)
+	// task_globel
+	indexs = []mongo.IndexModel{
+		{Keys: bson.D{{Key: "title", Value: "text"}}},
+		{Keys: bson.D{{Key: "updateAt", Value: 1}}, Options: options.Index().SetExpireAfterSeconds(0)},
+	}
+	creatCollIndex(cli, COLL_TASK_GLOBEL, indexs)
+	// task_location
+	indexs = []mongo.IndexModel{
+		{Keys: bson.D{{Key: "location", Value: "2dsphere"}}},
+		{Keys: bson.D{{Key: "title", Value: "text"}}},
+		{Keys: bson.D{{Key: "updateAt", Value: 1}}, Options: options.Index().SetExpireAfterSeconds(0)},
+	}
+	creatCollIndex(cli, COLL_TASK_LOCATION, indexs)
+	// user_create_task
+	indexs = []mongo.IndexModel{
+		{Keys: bson.D{{Key: "cid", Value: 1}}},
+	}
+	creatCollIndex(cli, COLL_USER_CREATE_TASK, indexs)
+	// user_interest
+	indexs = []mongo.IndexModel{
+		{Keys: bson.D{{Key: "cid", Value: 1}}},
+	}
+	creatCollIndex(cli, COLL_USER_INTEREST, indexs)
+	// user_task
+	indexs = []mongo.IndexModel{
+		{Keys: bson.D{{Key: "cid", Value: 1}}},
+	}
+	creatCollIndex(cli, COLL_USER_TASK, indexs)
+}
+
 type AppLoginModule struct {
 	HttpModule
 	_safe_req   map[string]bool
@@ -157,6 +232,7 @@ func (m *AppLoginModule) Init(mgr *moduleMgr) {
 	m._server_mod = mgr.GetModule(MOD_CLIENT_SERVER).(*ClientServerModule)
 
 	cutseg.LoadDict("dict/t_1.txt, dict/s_1.txt")
+	initCollIndex()
 }
 
 func (m *AppLoginModule) BeforRun() {
@@ -266,6 +342,12 @@ func (m *AppLoginModule) initRoter(r *gin.Engine) {
 	r.GET("/apiLoadInterestTask", m.apiLoadInterestTask)
 
 	m.safePost(r, "/apiAppCrash", m.apiAppCrash)
+	m.safePost(r, "/apiTaskCheck", m.apiTaskCheck)
+
+	r.GET("/apiLoadTaskChat", m.apiLoadTaskChat)
+	r.GET("/apiLoadUserChatList", m.apiLoadUserChatList)
+	r.GET("/apiLoadUserChatData", m.apiLoadUserChatData)
+	r.GET("/apiDeleteUserChatData", m.apiDeleteUserChatData)
 
 }
 
@@ -578,7 +660,7 @@ type mg_task struct {
 	CreateAt    string             `json:"createAt,omitempty" bson:"createAt"`
 	UpdateAt    string             `json:"updateAt,omitempty" bson:"updateAt"`
 	Cid         int64              `json:"cid,omitempty" bson:"cid"`
-	CreatorName string             `json:"creator_name" bson:"creator_name"`
+	CreatorName string             `json:"creator_name,omitempty" bson:"creator_name"`
 	CreatorIcon string             `json:"creator_icon,omitempty" bson:"creator_icon,omitempty"`
 	Title       string             `json:"title" bson:"title"`
 	Content     string             `json:"content" bson:"content"`
@@ -695,6 +777,70 @@ func checkInBlackList(qc *qmgo.QmgoClient, ctx context.Context, cid int64, black
 	return n > 0
 }
 
+type mg_task_check struct {
+	Id   primitive.ObjectID `json:"id,omitempty" bson:"_id"`
+	Time int                `json:"time,omitempty" bson:"time"`
+}
+
+func addTaskCheck(qc *qmgo.QmgoClient, ctx context.Context, taskid primitive.ObjectID) error {
+	coll := qc.Database.Collection(COLL_TASK_CHECK)
+	upopts := options.Update().SetUpsert(true)
+	qmopt := qmoption.UpdateOptions{UpdateHook: nil, UpdateOptions: upopts}
+	return coll.UpdateOne(ctx, bson.M{"_id": taskid}, bson.M{"$set": bson.M{"time": util.GetSecond()}}, qmopt)
+}
+
+func setTaskChecked(qc *qmgo.QmgoClient, ctx context.Context, taskid primitive.ObjectID) error {
+	coll := qc.Database.Collection(COLL_TASK)
+	var task mg_task
+	err := coll.Find(ctx, bson.M{"_id": taskid}).One(&task)
+	if err != nil {
+		return err
+	}
+
+	if task.State != util.TASK_STATE_IN_CHECK {
+		return nil
+	}
+	// 删除审核
+	collcheck := qc.Database.Collection(COLL_TASK_CHECK)
+	collcheck.RemoveId(ctx, taskid)
+
+	// 设置状态
+	err = coll.UpdateOne(ctx, bson.M{"_id": taskid}, bson.M{"$set": bson.M{"state": util.TASK_STATE_OPEN}})
+	if err != nil {
+		return err
+	}
+	// 加入global/location
+	// 过期时间
+	expireTime := task.EndTime - util.GetSecond()
+	worlds := cutseg.CutSearch(task.Title)
+	title := strings.Join(worlds, " ")
+	if task.Address != nil {
+		taskloc := mg_task_location{
+			Id:       task.Id,
+			Location: NewLocation(task.Address.Longitude, task.Address.Latitude),
+			UpdateAt: time.Now().Add(time.Second * time.Duration(expireTime)),
+			Title:    title,
+		}
+		coll := qc.Database.Collection(COLL_TASK_LOCATION)
+		_, err := coll.InsertOne(ctx, taskloc)
+		if err != nil {
+			return err
+		}
+	} else {
+		taskglo := mg_task_globel{
+			Id:       task.Id,
+			UpdateAt: time.Now().Add(time.Second * time.Duration(expireTime)),
+			Title:    title,
+		}
+		coll := qc.Database.Collection(COLL_TASK_GLOBEL)
+		_, err := coll.InsertOne(ctx, taskglo)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (m *AppLoginModule) apiCreateTask(c *gin.Context) {
 	cid := c.MustGet("userId").(int64)
 	hashval := c.MustGet("phoneHash").(uint32)
@@ -713,52 +859,33 @@ func (m *AppLoginModule) apiCreateTask(c *gin.Context) {
 	}
 	// ...
 
+	user := m.getUserInfo(cid, hashval)
+	if user == nil {
+		m.ResponesError(c, 1, "用户数据错误")
+		return
+	}
+
 	task.Cid = cid
 	task.Id = qmgo.NewObjectID()
 	nowtimestr := util.NowTime()
 	task.CreateAt = nowtimestr
 	task.UpdateAt = nowtimestr
-
-	// 过期时间
-	expireTime := task.EndTime - nowsec
-
-	worlds := cutseg.CutSearch(task.Title)
-	title := strings.Join(worlds, " ")
+	task.CreatorName = user.Name
+	task.CreatorIcon = user.Icon
+	task.State = util.TASK_STATE_IN_CHECK
 
 	// 插入数据库
 	ires := m._mg_mgr.RequestFuncCallHash(hashval, func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
 		// 事务
 		_, err := qc.DoTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
-			if task.Address != nil {
-				// task.Location = &loc
-				taskloc := mg_task_location{
-					Id:       task.Id,
-					Location: NewLocation(task.Address.Longitude, task.Address.Latitude),
-					UpdateAt: time.Now().Add(time.Second * time.Duration(expireTime)),
-					Title:    title,
-				}
-
-				coll := qc.Database.Collection("task_location")
-				_, err := coll.InsertOne(sessCtx, taskloc)
-				if err != nil {
-					util.Log_error("insert task_location err:%s", err.Error())
-					return nil, err
-				}
-			} else {
-				taskglo := mg_task_globel{
-					Id:       task.Id,
-					UpdateAt: time.Now().Add(time.Second * time.Duration(expireTime)),
-					Title:    title,
-				}
-				coll := qc.Database.Collection("task_globel")
-				_, err := coll.InsertOne(sessCtx, taskglo)
-				if err != nil {
-					util.Log_error("insert task_globel err:%s", err.Error())
-					return nil, err
-				}
+			// 加入审核列表
+			err := addTaskCheck(qc, sessCtx, task.Id)
+			if err != nil {
+				util.Log_error("insert task check err:%s", err.Error())
+				return nil, err
 			}
 
-			coll := qc.Database.Collection("task")
+			coll := qc.Database.Collection(COLL_TASK)
 			res, err := coll.InsertOne(sessCtx, task)
 			if err != nil {
 				util.Log_error("insert task err:%s", err.Error())
@@ -790,7 +917,7 @@ func (m *AppLoginModule) apiCreateTask(c *gin.Context) {
 	}
 }
 
-func taskIdToObjectId(id string) *primitive.ObjectID {
+func stringToObjectId(id string) *primitive.ObjectID {
 	objid, err := primitive.ObjectIDFromHex(id)
 	if err != nil {
 		util.Log_error("taskid err: %s", err.Error())
@@ -800,27 +927,26 @@ func taskIdToObjectId(id string) *primitive.ObjectID {
 }
 
 func (m *AppLoginModule) GetTaskInfo(taskid string) *mg_task {
-	objid := taskIdToObjectId(taskid)
+	objid := stringToObjectId(taskid)
 	if objid == nil {
 		return nil
 	}
 	return m.getTaskInfoObjId(*objid, util.StringHash(taskid))
 }
 
-func getTaskInfoByQmgo(qc *qmgo.QmgoClient, ctx context.Context, objid primitive.ObjectID) *mg_task {
+func getTaskInfoByQmgo(qc *qmgo.QmgoClient, ctx context.Context, objid primitive.ObjectID) (*mg_task, error) {
 	var task mg_task
-	coll := qc.Database.Collection("task")
+	coll := qc.Database.Collection(COLL_TASK)
 	err := coll.Find(ctx, bson.M{"_id": objid}).One(&task)
 	if err != nil {
-		util.Log_error("gettask err: %s", err.Error())
-		return nil
+		return nil, err
 	}
-	return &task
+	return &task, nil
 }
 
 func getTaskByPipline(qc *qmgo.QmgoClient, ctx context.Context, pipline interface{}) (*mg_task, error) {
 	var task mg_task
-	coll := qc.Database.Collection("task")
+	coll := qc.Database.Collection(COLL_TASK)
 	err := coll.Aggregate(ctx, pipline).One(&task)
 	if err != nil {
 		util.Log_error("gettask pipline err: %s", err.Error())
@@ -831,7 +957,11 @@ func getTaskByPipline(qc *qmgo.QmgoClient, ctx context.Context, pipline interfac
 
 func (m *AppLoginModule) getTaskInfoObjId(objid primitive.ObjectID, hashval uint32) *mg_task {
 	tres := m._mg_mgr.RequestFuncCallHash(hashval, func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
-		return getTaskInfoByQmgo(qc, ctx, objid)
+		task, err := getTaskInfoByQmgo(qc, ctx, objid)
+		if err != nil {
+			util.Log_error("get taskid:%s err:%s", objid.Hex(), err.Error())
+		}
+		return task
 	}).(*mg_task)
 	return tres
 }
@@ -851,95 +981,58 @@ func (m *AppLoginModule) apiUpdateTask(c *gin.Context) {
 		return
 	}
 	// ...
+	cid := c.MustGet("userId").(int64)
+	hashval := c.MustGet("phoneHash").(uint32)
+	user := m.getUserInfo(cid, hashval)
+	if user == nil {
+		m.ResponesError(c, 1, "用户数据错误")
+		return
+	}
+
 	task.UpdateAt = util.NowTime()
-	// 过期时间
-	expireTime := task.EndTime - util.GetSecond()
-	exptime := time.Now().Add(time.Second * time.Duration(expireTime))
+	task.CreatorName = user.Name
+	task.CreatorIcon = user.Icon
+	task.State = util.TASK_STATE_IN_CHECK
+
 	taskhash := util.StringHash(task.Id.String())
-
-	worlds := cutseg.CutSearch(task.Title)
-	title := strings.Join(worlds, " ")
-
-	// 更新
-	upopts := options.Update().SetUpsert(true)
-	qmopt := qmoption.UpdateOptions{UpdateHook: nil, UpdateOptions: upopts}
 	tres := m._mg_mgr.RequestFuncCallHash(taskhash, func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
-		oldtask := getTaskInfoByQmgo(qc, ctx, task.Id)
-		if oldtask == nil || oldtask.State != 0 {
+		oldtask, err := getTaskInfoByQmgo(qc, ctx, task.Id)
+		if err != nil {
+			util.Log_error("update task get taskid:%s err:%s", task.Id.Hex(), err.Error())
+			return false
+		}
+		if oldtask == nil || oldtask.State == util.TASK_STATE_FINISH {
 			// 已完成不能更新
 			return false
 		}
+
+		task.Cid = cid
+		task.Id = oldtask.Id
+		task.CreateAt = oldtask.CreateAt
+		task.UpdateAt = oldtask.UpdateAt
 		task.Delete = oldtask.Delete
-		_, err := qc.DoTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
-			loc_coll := qc.Database.Collection("task_location")
-			glo_coll := qc.Database.Collection("task_globel")
-			if oldtask.Address != nil {
-				if task.Address == nil {
+		// if oldtask.State == util.TASK_STATE_FINISH {
+		// 	task.State = util.TASK_STATE_FINISH
+		// }
+
+		_, err = qc.DoTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
+			// 更新审核
+			err := addTaskCheck(qc, sessCtx, task.Id)
+			if oldtask.State != util.TASK_STATE_IN_CHECK {
+				// 删除globel/location
+				if oldtask.Address != nil {
+					loc_coll := qc.Database.Collection(COLL_TASK_LOCATION)
 					// 删除 local 报错不管
 					loc_coll.RemoveId(sessCtx, task.Id)
-					// 插入 globel
-					taskglo := mg_task_globel{
-						Id:       task.Id,
-						UpdateAt: exptime,
-						Title:    title,
-					}
-					_, err = glo_coll.InsertOne(sessCtx, taskglo)
-					if err != nil {
-						util.Log_error("update insert task_globel err:%s", err.Error())
-						return nil, err
-					}
-
 				} else {
-					// 更新 local
-					loc := NewLocation(task.Address.Longitude, task.Address.Latitude)
-					// taskloc := mg_task_location{
-					// 	Id:       task.Id,
-					// 	Location: loc,
-					// 	UpdateAt: exptime,
-					// }
-					// err := loc_coll.ReplaceOne(sessCtx, bson.M{"_id": task.Id}, taskloc)
-					err := loc_coll.UpdateOne(sessCtx, bson.M{"_id": task.Id}, bson.M{"$set": bson.M{"location": loc, "updateAt": exptime, "title": title}}, qmopt)
-					if err != nil {
-						// 更新失败改插入
-						// _, err = loc_coll.InsertOne(sessCtx, taskloc)
-						// if err != nil {
-						util.Log_error("update task 1 err:%s", err.Error())
-						// 	return nil, err
-						// }
-						return nil, err
-					}
-				}
-			} else if task.Address != nil {
-				// 插入 local
-				taskloc := mg_task_location{
-					Id:       task.Id,
-					Location: NewLocation(task.Address.Longitude, task.Address.Latitude),
-					UpdateAt: exptime,
-					Title:    title,
-				}
-				_, err := loc_coll.InsertOne(sessCtx, taskloc)
-				if err != nil {
-					util.Log_error("update task 3 err:%s", err.Error())
-					return nil, err
-				}
-				// 删除globel 删除失败不管
-				glo_coll.RemoveId(sessCtx, task.Id)
-			} else {
-				// globel
-				// taskglo := mg_task_globel{
-				// 	Id:       task.Id,
-				// 	UpdateAt: exptime,
-				// }
-				err = glo_coll.UpdateOne(sessCtx, bson.M{"_id": task.Id}, bson.M{"$set": bson.M{"updateAt": exptime, "title": title}}, qmopt)
-				if err != nil {
-					util.Log_error("replace task_globel err:%s", err.Error())
-					return nil, err
+					// 删除 globel
+					glo_coll := qc.Database.Collection(COLL_TASK_GLOBEL)
+					glo_coll.RemoveId(sessCtx, task.Id)
 				}
 			}
-
 			// 更新 task
-			coll := qc.Database.Collection("task")
-			err := coll.ReplaceOne(sessCtx, bson.M{"_id": task.Id}, task)
+			coll := qc.Database.Collection(COLL_TASK)
+			err = coll.ReplaceOne(sessCtx, bson.M{"_id": task.Id}, task)
 			if err != nil {
 				util.Log_error("update task 5 err:%s", err.Error())
 				return nil, err
@@ -1042,7 +1135,7 @@ func (m *AppLoginModule) apiGetTaskInfo(c *gin.Context) {
 			bson.M{"$addFields": bson.M{"join": bson.M{"$arrayElemAt": bson.A{"$join", 0}}}},
 		}
 		res := m._mg_mgr.RequestFuncCall(func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
-			coll := qc.Database.Collection("task_location")
+			coll := qc.Database.Collection(COLL_TASK_LOCATION)
 			err := coll.Aggregate(ctx, pipline).All(&taskResult.Data)
 			if err != nil {
 				util.Log_error("serch task err:%s", err.Error())
@@ -1093,7 +1186,7 @@ func (m *AppLoginModule) apiGetTaskInfo(c *gin.Context) {
 
 		var globeldata []mg_task
 		res := m._mg_mgr.RequestFuncCall(func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
-			coll := qc.Database.Collection("task_globel")
+			coll := qc.Database.Collection(COLL_TASK_GLOBEL)
 			// err := coll.Find(ctx, bson.M{}).Sort("-_id").Skip(int64(taskconf.GlobelLimit)).Limit(20).All(&taskResult.Data)
 			err := coll.Aggregate(ctx, pipline2).All(&globeldata)
 			if err != nil {
@@ -1126,7 +1219,7 @@ func (m *AppLoginModule) apiGetOneTaskInfo(c *gin.Context) {
 		m.ResponesError(c, 1, "数据错误")
 		return
 	}
-	objid := taskIdToObjectId(taskid)
+	objid := stringToObjectId(taskid)
 	if objid == nil {
 		m.ResponesError(c, 1, "数据错误")
 		return
@@ -1226,7 +1319,7 @@ func (m *AppLoginModule) apiDeleteMyTaskInfo(c *gin.Context) {
 		return
 	}
 
-	objid := taskIdToObjectId(taskid)
+	objid := stringToObjectId(taskid)
 	if objid == nil {
 		m.ResponesError(c, 1, "任务id错误")
 		return
@@ -1234,18 +1327,21 @@ func (m *AppLoginModule) apiDeleteMyTaskInfo(c *gin.Context) {
 	taskhash := util.StringHash(taskid)
 	res := m._mg_mgr.RequestFuncCallHash(taskhash, func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
 		_, err := qc.DoTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
-			coll := qc.Database.Collection("task")
+			coll := qc.Database.Collection(COLL_TASK)
 			err := coll.UpdateOne(sessCtx, bson.M{"cid": cid, "_id": objid}, bson.M{"$set": bson.M{"delete": 1}})
 			if err != nil {
 				util.Log_error("delete task err:%s", err.Error())
 				return nil, err
 			}
-			loc_coll := qc.Database.Collection("task_location")
-			glo_coll := qc.Database.Collection("task_globel")
+			loc_coll := qc.Database.Collection(COLL_TASK_LOCATION)
+			glo_coll := qc.Database.Collection(COLL_TASK_GLOBEL)
 			// 删除 location
 			loc_coll.RemoveId(sessCtx, objid)
 			// 删除 globel
 			glo_coll.RemoveId(sessCtx, objid)
+			// 删除 审核
+			collcheck := qc.Database.Collection(COLL_TASK_CHECK)
+			collcheck.RemoveId(sessCtx, objid)
 			return nil, nil
 		})
 		if err == nil {
@@ -1287,7 +1383,7 @@ func (m *AppLoginModule) apiJoinTask(c *gin.Context) {
 	}
 
 	taskhash := util.StringHash(taskid)
-	objid := taskIdToObjectId(taskid)
+	objid := stringToObjectId(taskid)
 	if objid == nil {
 		m.ResponesError(c, 1, "数据错误")
 		return
@@ -1314,9 +1410,9 @@ func (m *AppLoginModule) apiJoinTask(c *gin.Context) {
 			util.Log_waring("join task nil taskid:%s", taskid)
 			return util.ERRCODE_ERROR
 		}
-		if task.State != 0 {
-			// 已完成不能加入
-			util.Log_waring("join task finished taskid:%s", taskid)
+		if task.State != util.TASK_STATE_OPEN {
+			// 不是进行中不能加入
+			util.Log_waring("join task not open taskid:%s", taskid)
 			return util.ERRCODE_ERROR
 		}
 		// 是否已报名
@@ -1418,7 +1514,7 @@ func (m *AppLoginModule) apiQuitTask(c *gin.Context) {
 		return
 	}
 
-	objid := taskIdToObjectId(taskid)
+	objid := stringToObjectId(taskid)
 	if objid == nil {
 		m.ResponesError(c, 1, "数据错误")
 		return
@@ -1498,7 +1594,7 @@ func (m *AppLoginModule) apiKickTask(c *gin.Context) {
 		m.ResponesError(c, 1, "数据错误")
 		return
 	}
-	objid := taskIdToObjectId(taskid)
+	objid := stringToObjectId(taskid)
 	if objid == nil {
 		m.ResponesError(c, 1, "数据错误")
 		return
@@ -1584,7 +1680,7 @@ func (m *AppLoginModule) apiDeleteUserJoin(c *gin.Context) {
 		m.ResponesError(c, 1, "数据错误")
 		return
 	}
-	objid := taskIdToObjectId(taskid)
+	objid := stringToObjectId(taskid)
 	if objid == nil {
 		m.ResponesError(c, 1, "数据错误")
 		return
@@ -1696,9 +1792,9 @@ func (m *AppLoginModule) apiFinishTask(c *gin.Context) {
 			}
 		}
 		// 更新
-		if task.State == 0 {
+		if task.State != util.TASK_STATE_FINISH {
 			coll := qc.Database.Collection(COLL_TASK)
-			err := coll.UpdateOne(ctx, bson.M{"_id": task.Id}, bson.M{"$set": bson.M{"state": 1}})
+			err := coll.UpdateOne(ctx, bson.M{"_id": task.Id}, bson.M{"$set": bson.M{"state": util.TASK_STATE_FINISH}})
 			if err != nil {
 				util.Log_error("update task state %s", err.Error())
 				return util.ERRCODE_ERROR
@@ -1755,7 +1851,7 @@ func (m *AppLoginModule) apiGetTaskReward(c *gin.Context) {
 		m.ResponesError(c, 1, "数据错误")
 		return
 	}
-	objid := taskIdToObjectId(taskid)
+	objid := stringToObjectId(taskid)
 	if objid == nil {
 		m.ResponesError(c, 1, "数据错误")
 		return
@@ -1831,7 +1927,7 @@ func (m *AppLoginModule) apiPayTaskCost(c *gin.Context) {
 		m.ResponesError(c, 1, "数据错误")
 		return
 	}
-	objid := taskIdToObjectId(taskid)
+	objid := stringToObjectId(taskid)
 	if objid == nil {
 		m.ResponesError(c, 1, "数据错误")
 		return
@@ -1922,7 +2018,7 @@ func (m *AppLoginModule) apiGetTaskCost(c *gin.Context) {
 		m.ResponesError(c, 1, "数据错误")
 		return
 	}
-	objid := taskIdToObjectId(taskid)
+	objid := stringToObjectId(taskid)
 	if objid == nil {
 		m.ResponesError(c, 1, "数据错误")
 		return
@@ -2223,7 +2319,7 @@ func (m *AppLoginModule) apiSearchTask(c *gin.Context) {
 	if taskconf.LocMax == 0 {
 		pipline := getSearchPipline(taskconf.Search, taskconf.Loc_limit, neednum)
 		res := m._mg_mgr.RequestFuncCall(func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
-			coll := qc.Database.Collection("task_location")
+			coll := qc.Database.Collection(COLL_TASK_LOCATION)
 			err := coll.Aggregate(ctx, pipline).All(&taskResult.Data)
 			if err != nil {
 				util.Log_error("search task err:%s", err.Error())
@@ -2237,7 +2333,7 @@ func (m *AppLoginModule) apiSearchTask(c *gin.Context) {
 		}
 		getlen := len(taskResult.Data)
 		taskconf.Loc_limit += getlen
-		if getlen <= 0 {
+		if getlen <= neednum {
 			taskconf.LocMax = 1
 		}
 	}
@@ -2246,7 +2342,7 @@ func (m *AppLoginModule) apiSearchTask(c *gin.Context) {
 		var globeldata []mg_task
 		pipline := getSearchPipline(taskconf.Search, taskconf.GlobelLimit, neednum)
 		res := m._mg_mgr.RequestFuncCall(func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
-			coll := qc.Database.Collection("task_globel")
+			coll := qc.Database.Collection(COLL_TASK_GLOBEL)
 			err := coll.Aggregate(ctx, pipline).All(&globeldata)
 			if err != nil {
 				util.Log_error("search task_globel err:%s", err.Error())
@@ -2263,7 +2359,7 @@ func (m *AppLoginModule) apiSearchTask(c *gin.Context) {
 			taskResult.Data = append(taskResult.Data, globeldata...)
 			taskconf.GlobelLimit += getlen
 		}
-		if getlen <= 0 {
+		if getlen <= neednum {
 			taskconf.GlobelMax = 1
 		}
 	}
@@ -2288,7 +2384,7 @@ func (m *AppLoginModule) apiTaskPushInterest(c *gin.Context) {
 		return
 	}
 
-	objid := taskIdToObjectId(taskid)
+	objid := stringToObjectId(taskid)
 	if objid == nil {
 		m.ResponesError(c, 1, "输入数据错误")
 		return
@@ -2322,7 +2418,7 @@ func (m *AppLoginModule) apiTaskPullInterest(c *gin.Context) {
 		return
 	}
 
-	objid := taskIdToObjectId(taskid)
+	objid := stringToObjectId(taskid)
 	if objid == nil {
 		m.ResponesError(c, 1, "输入数据错误")
 		return
@@ -2439,4 +2535,132 @@ func (m *AppLoginModule) apiAppCrash(c *gin.Context) {
 			util.Log_error(err.Error())
 		}
 	})
+}
+
+func (m *AppLoginModule) apiTaskCheck(c *gin.Context) {
+	var strlist JsonStringList
+	err := c.ShouldBindJSON(&strlist)
+	if err != nil {
+		util.Log_error("apiTaskCheck json err:%s", err.Error())
+		m.ResponesError(c, util.ERRCODE_ERROR, "数据错误")
+		return
+	}
+
+	for _, v := range strlist.Data {
+		objid := stringToObjectId(v)
+		if objid != nil {
+			m._mg_mgr.RequestFuncCallNoRes(func(ctx context.Context, qc *qmgo.QmgoClient) {
+				err := setTaskChecked(qc, ctx, *objid)
+				if err != nil {
+					util.Log_error("set taskcheck err:%s", err.Error())
+				}
+			})
+		}
+	}
+	m.ResponesJsonData(c, nil)
+}
+
+func (m *AppLoginModule) apiLoadTaskChat(c *gin.Context) {
+	taskid := c.DefaultQuery("taskid", "")
+	startindex := util.StringToInt(c.DefaultQuery("start", "0"))
+	num := util.StringToInt(c.DefaultQuery("num", "0"))
+	if len(taskid) == 0 || num <= 0 || num > 20 {
+		m.ResponesError(c, 1, "输入数据错误")
+		return
+	}
+
+	objid := stringToObjectId(taskid)
+	if objid == nil {
+		m.ResponesError(c, 1, "输入数据错误")
+		return
+	}
+
+	chatinfo := mg_task_chat{
+		Id:    *objid,
+		Count: -1,
+	}
+	err := m._mg_mgr.RequestFuncCall(func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
+		coll := qc.Database.Collection(COLL_TASK_CHAT)
+		pip := getTaskChatPipline(*objid, startindex, num)
+		err := coll.Aggregate(ctx, pip).One(&chatinfo)
+		return err
+	})
+	if err != nil {
+		util.Log_error("apiLoadTaskChat: %s", err.(error).Error())
+	}
+	m.ResponesJsonData(c, chatinfo)
+}
+
+func (m *AppLoginModule) apiLoadUserChatList(c *gin.Context) {
+	cid := c.MustGet("userId").(int64)
+	var chatlist []mg_chat_user_list
+
+	pipline := bson.A{
+		bson.M{"$match": bson.M{"$or": bson.A{bson.M{"cidhei": cid}, bson.M{"cidlow": cid}},
+			"delete": bson.M{"$nin": bson.A{cid}}}},
+		bson.M{"$set": bson.M{"data": bson.M{"$slice": bson.A{"$data", -1, 1}}}},
+	}
+
+	m._mg_mgr.RequestFuncCall(func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
+		coll := qc.Database.Collection(COLL_CHAT_USER_LIST)
+		// err := coll.Find(ctx, bson.M{"$or": bson.A{bson.M{"cidhei": cid}, bson.M{"cidlow": cid}}}). .All(&chatlist)
+		err := coll.Aggregate(ctx, pipline).All(&chatlist)
+		if err != nil {
+			util.Log_error("load UserChatList err:%s", err.Error())
+		}
+		return nil
+	})
+
+	m.ResponesJsonData(c, chatlist)
+}
+
+func (m *AppLoginModule) apiLoadUserChatData(c *gin.Context) {
+	id := c.DefaultQuery("id", "")
+	startindex := util.StringToInt(c.DefaultQuery("start", "0"))
+	num := util.StringToInt(c.DefaultQuery("num", "0"))
+
+	if len(id) == 0 || num <= 0 || num > 20 {
+		m.ResponesError(c, 1, "输入数据错误")
+		return
+	}
+
+	objid := stringToObjectId(id)
+	if objid == nil {
+		m.ResponesError(c, 1, "输入数据错误")
+		return
+	}
+
+	chatlist := mg_chat_user_list{
+		Id:    *objid,
+		Count: -1,
+	}
+	err := m._mg_mgr.RequestFuncCall(func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
+		coll := qc.Database.Collection(COLL_CHAT_USER_LIST)
+		pip := getTaskChatPipline(*objid, startindex, num)
+		err := coll.Aggregate(ctx, pip).One(&chatlist)
+		return err
+	})
+	if err != nil {
+		util.Log_error("apiLoadUserChatData err: %s", err.(error).Error())
+	}
+	m.ResponesJsonData(c, chatlist)
+}
+
+func (m *AppLoginModule) apiDeleteUserChatData(c *gin.Context) {
+	cid := c.MustGet("userId").(int64)
+	id := c.DefaultQuery("id", "")
+
+	objid := stringToObjectId(id)
+	if objid == nil {
+		m.ResponesError(c, 1, "输入数据错误")
+		return
+	}
+
+	upopts := options.Update().SetUpsert(true)
+	qmopt := qmoption.UpdateOptions{UpdateHook: nil, UpdateOptions: upopts}
+	m._mg_mgr.RequestFuncCallNoRes(func(ctx context.Context, qc *qmgo.QmgoClient) {
+		coll := qc.Database.Collection(COLL_CHAT_USER_LIST)
+		coll.UpdateOne(ctx, bson.M{"_id": objid}, bson.M{"$addToSet": bson.M{"delete": cid}}, qmopt)
+	})
+	m.ResponesJsonData(c, nil)
 }

@@ -138,7 +138,7 @@ func (m *ServerModule) startListen() {
 				util.Log_error(err.Error())
 			} else {
 				util.Log_info("accept conn %s", conn.RemoteAddr().String())
-				m._net.AcceptConn(conn, m.onReadConnBuff)
+				m._net.AcceptConn(conn, m.onReadConnBuff, false)
 			}
 		}
 	}()

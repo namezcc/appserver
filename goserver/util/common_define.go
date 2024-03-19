@@ -39,9 +39,9 @@ const (
 )
 
 const (
-	TASK_STATE_NONE    = 0
-	TASK_STATE_BE_KICK = 1 //被踢
-	TASK_STATE_CANCEL  = 2 //解散
+	TASK_STATE_IN_CHECK = 0 //审核中
+	TASK_STATE_OPEN     = 1 //进行中
+	TASK_STATE_FINISH   = 2 //已完成
 )
 
 const (

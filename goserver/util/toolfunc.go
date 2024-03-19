@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -93,14 +94,17 @@ func Init_loger(fname string) {
 	if err != nil {
 		panic(err)
 	}
-	logerr = log.New(lf, "[error]", log.Ldate|log.Ltime)
-	logwaring = log.New(lf, "[waring]", log.Ldate|log.Ltime)
-	loginfo = log.New(lf, "[info]", log.Ldate|log.Ltime)
+	logerr = log.New(lf, "[error]", log.Ldate|log.Ltime|log.Lshortfile)
+	logwaring = log.New(lf, "[waring]", log.Ldate|log.Ltime|log.Lshortfile)
+	loginfo = log.New(lf, "[info]", log.Ldate|log.Ltime|log.Lshortfile)
 }
 
 var sysType = runtime.GOOS
 
 func Log_error(sfmt string, a ...interface{}) {
+	_, filePath, lineNum, _ := runtime.Caller(1) // 第二个参数为0表示当前函数，所以传入1
+	fileName := filepath.Base(filePath)
+	sfmt = fmt.Sprintf("%s:%d ", fileName, lineNum) + sfmt
 	if sysType == "windows" {
 		fmt.Printf(sfmt+"\n", a...)
 	}
@@ -109,6 +113,9 @@ func Log_error(sfmt string, a ...interface{}) {
 }
 
 func Log_waring(sfmt string, a ...interface{}) {
+	_, filePath, lineNum, _ := runtime.Caller(1) // 第二个参数为0表示当前函数，所以传入1
+	fileName := filepath.Base(filePath)
+	sfmt = fmt.Sprintf("%s:%d ", fileName, lineNum) + sfmt
 	if sysType == "windows" {
 		fmt.Printf(sfmt+"\n", a...)
 	}
@@ -117,6 +124,9 @@ func Log_waring(sfmt string, a ...interface{}) {
 }
 
 func Log_info(sfmt string, a ...interface{}) {
+	_, filePath, lineNum, _ := runtime.Caller(1) // 第二个参数为0表示当前函数，所以传入1
+	fileName := filepath.Base(filePath)
+	sfmt = fmt.Sprintf("%s:%d ", fileName, lineNum) + sfmt
 	if sysType == "windows" {
 		fmt.Printf(sfmt+"\n", a...)
 	}

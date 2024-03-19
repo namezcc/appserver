@@ -8,7 +8,7 @@ import (
 type HandleFunc func(Msgpack)
 
 type connMgr struct {
-	_connvec     []*Tcpconn
+	_connvec     []connI
 	_connId_pool []int
 	_pool_index  int
 }
@@ -21,7 +21,7 @@ func NewconnMgr() *ConnMgr {
 	mgr := ConnMgr{}
 
 	mgr._pool_index = 0
-	mgr._connvec = make([]*Tcpconn, 1000)
+	mgr._connvec = make([]connI, 1000)
 	mgr._connId_pool = make([]int, 1000)
 
 	for i := 0; i < 1000; i++ {
@@ -49,7 +49,14 @@ func (_m *connMgr) AddConn(c net.Conn, readcall ReadCallBack, closecall onClose,
 	return conn
 }
 
-func (_m *connMgr) CloseConn(cid int) *Tcpconn {
+func (_m *connMgr) AddWsConn(c net.Conn, readcall ReadCallBack, closecall onClose, _ct int) {
+	cid := _m.popConnId()
+	conn := newWsconn(cid, c, closecall, _ct)
+	conn.StartRead(readcall)
+	_m._connvec[cid] = conn
+}
+
+func (_m *connMgr) CloseConn(cid int) connI {
 	conn := _m._connvec[cid]
 	if conn == nil {
 		util.Log_error("error close conn nil")

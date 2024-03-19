@@ -29,6 +29,7 @@ type connServer struct {
 type msgConn struct {
 	c    net.Conn
 	call network.ReadCallBack
+	isws bool
 }
 
 type msgSend struct {
@@ -70,10 +71,11 @@ func (m *netModule) ConnectServer(addr string, mod *modulebase, readcall network
 	m.sendMsg(handle.M_CONNECT_SERVER, d)
 }
 
-func (m *netModule) AcceptConn(c net.Conn, readcall network.ReadCallBack) {
+func (m *netModule) AcceptConn(c net.Conn, readcall network.ReadCallBack, ws bool) {
 	d := msgConn{
 		c:    c,
 		call: readcall,
+		isws: ws,
 	}
 	m.sendMsg(handle.M_ACCEPT_CONN, d)
 }
@@ -126,7 +128,11 @@ func (m *netModule) onConnectServer(msg *handle.BaseMsg) {
 
 func (m *netModule) onAcceptConn(msg *handle.BaseMsg) {
 	d := msg.Data.(msgConn)
-	m._connMgr.AddConn(d.c, d.call, m.onConnClose, CONN_CLIENT)
+	if d.isws {
+		m._connMgr.AddWsConn(d.c, d.call, m.onConnClose, CONN_CLIENT)
+	} else {
+		m._connMgr.AddConn(d.c, d.call, m.onConnClose, CONN_CLIENT)
+	}
 }
 
 func (m *netModule) onSendMsg(msg *handle.BaseMsg) {
