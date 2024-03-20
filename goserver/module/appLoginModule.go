@@ -343,6 +343,7 @@ func (m *AppLoginModule) initRoter(r *gin.Engine) {
 
 	m.safePost(r, "/apiAppCrash", m.apiAppCrash)
 	m.safePost(r, "/apiTaskCheck", m.apiTaskCheck)
+	m.safeGet(r, "/apiTaskCheckAll", m.apiTaskCheckAll)
 
 	r.GET("/apiLoadTaskChat", m.apiLoadTaskChat)
 	r.GET("/apiLoadUserChatList", m.apiLoadUserChatList)
@@ -2559,6 +2560,28 @@ func (m *AppLoginModule) apiTaskCheck(c *gin.Context) {
 		}
 	}
 	m.ResponesJsonData(c, nil)
+}
+
+func (m *AppLoginModule) apiTaskCheckAll(c *gin.Context) {
+	var checks []mg_task_check
+	m._mg_mgr.RequestFuncCall(func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
+		coll := qc.Database.Collection(COLL_TASK_CHECK)
+		err := coll.Find(ctx, bson.M{}).All(&checks)
+		if err != nil {
+			util.Log_error("apiTaskCheckAll err:%s", err.Error())
+		}
+		return nil
+	})
+
+	for _, v := range checks {
+		m._mg_mgr.RequestFuncCallNoRes(func(ctx context.Context, qc *qmgo.QmgoClient) {
+			err := setTaskChecked(qc, ctx, v.Id)
+			if err != nil {
+				util.Log_error("set taskcheck id:%s err:%s", v.Id.Hex(), err.Error())
+			}
+		})
+	}
+	m.ResponesJsonData(c, checks)
 }
 
 func (m *AppLoginModule) apiLoadTaskChat(c *gin.Context) {
