@@ -445,7 +445,8 @@ func (m *AppLoginModule) phoneCode(c *gin.Context) {
 	})
 
 	util.Log_info("phonecode phone: %s code:%s", pnum, codeinfo.Code)
-	c.JSON(http.StatusOK, gin.H{"code": 0, "msg": "success"})
+	// c.JSON(http.StatusOK, gin.H{"code": 0, "msg": "success"})
+	m.ResponesJsonData(c, codeinfo.Code)
 }
 
 type userLoginData struct {
