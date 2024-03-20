@@ -1,10 +1,8 @@
 #!/bin/sh
-mkdir -p jsback
-\cp ../../../../../_out/bin/commonconf/* jsback/
 
 if [ "$1" = "" ]
 then
-docker build -t goserver .
+docker build -t appserver .
 else
-docker build -t goserver:$1 .
+docker build -t appserver:$1 .
 fi

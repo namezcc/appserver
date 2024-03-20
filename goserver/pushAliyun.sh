@@ -9,8 +9,8 @@ fi
 echo "push version $version"
 
 url=registry.cn-hangzhou.aliyuncs.com/loopserver
-image=$url/goserver:$version
+image=$url/appserver:$version
 
-docker tag goserver:$version $image
+docker tag appserver:$version $image
 docker push $image
 docker rmi $(docker images -f "dangling=true" -q)

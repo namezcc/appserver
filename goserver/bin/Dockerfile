@@ -4,6 +4,5 @@ COPY . ./
 RUN /bin/cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime &&\
     echo 'Asia/Shanghai' >/etc/timezone &&\
     ulimit -c unlimited &&\
-    mv jsback commonconf &&\
     mkdir -p /tmp/coredump
-CMD ["monitor","1"]
+CMD ["appService","1"]

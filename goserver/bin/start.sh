@@ -23,15 +23,7 @@ function startserver()
 if [[ "$1" == "" || "$2" == "" ]]
 then
 
-startserver service_find 1
-startserver service_find 2
-startserver service_find 3
-startserver k8service 1
-startserver monitor 1
-startserver monitor 2
-startserver clientService 1
-startserver loginService 1
-startserver master 1
+startserver appService 1
 
 else
 startserver $1 $2
