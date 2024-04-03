@@ -843,6 +843,39 @@ func setTaskChecked(qc *qmgo.QmgoClient, ctx context.Context, taskid primitive.O
 	return nil
 }
 
+func addToPublic(qc *qmgo.QmgoClient, ctx context.Context, task mg_task) error {
+	// 加入global/location
+	// 过期时间
+	expireTime := task.EndTime - util.GetSecond()
+	worlds := cutseg.CutSearch(task.Title)
+	title := strings.Join(worlds, " ")
+	if task.Address != nil {
+		taskloc := mg_task_location{
+			Id:       task.Id,
+			Location: NewLocation(task.Address.Longitude, task.Address.Latitude),
+			UpdateAt: time.Now().Add(time.Second * time.Duration(expireTime)),
+			Title:    title,
+		}
+		coll := qc.Database.Collection(COLL_TASK_LOCATION)
+		_, err := coll.InsertOne(ctx, taskloc)
+		if err != nil {
+			return err
+		}
+	} else {
+		taskglo := mg_task_globel{
+			Id:       task.Id,
+			UpdateAt: time.Now().Add(time.Second * time.Duration(expireTime)),
+			Title:    title,
+		}
+		coll := qc.Database.Collection(COLL_TASK_GLOBEL)
+		_, err := coll.InsertOne(ctx, taskglo)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (m *AppLoginModule) apiCreateTask(c *gin.Context) {
 	cid := c.MustGet("userId").(int64)
 	hashval := c.MustGet("phoneHash").(uint32)
@@ -881,9 +914,15 @@ func (m *AppLoginModule) apiCreateTask(c *gin.Context) {
 		// 事务
 		_, err := qc.DoTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
 			// 加入审核列表
-			err := addTaskCheck(qc, sessCtx, task.Id)
+			// err := addTaskCheck(qc, sessCtx, task.Id)
+			// if err != nil {
+			// 	util.Log_error("insert task check err:%s", err.Error())
+			// 	return nil, err
+			// }
+			task.State = util.TASK_STATE_OPEN
+			err := addToPublic(qc, sessCtx, task)
 			if err != nil {
-				util.Log_error("insert task check err:%s", err.Error())
+				util.Log_error("insert task to public err:%s", err.Error())
 				return nil, err
 			}
 
