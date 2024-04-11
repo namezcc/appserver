@@ -1052,13 +1052,14 @@ func (m *AppLoginModule) apiUpdateTask(c *gin.Context) {
 		task.CreateAt = oldtask.CreateAt
 		task.UpdateAt = oldtask.UpdateAt
 		task.Delete = oldtask.Delete
+		task.State = oldtask.State
 		// if oldtask.State == util.TASK_STATE_FINISH {
 		// 	task.State = util.TASK_STATE_FINISH
 		// }
 
 		_, err = qc.DoTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
 			// 更新审核
-			err := addTaskCheck(qc, sessCtx, task.Id)
+			// err := addTaskCheck(qc, sessCtx, task.Id)
 			if oldtask.State != util.TASK_STATE_IN_CHECK {
 				// 删除globel/location
 				if oldtask.Address != nil {
@@ -1070,6 +1071,12 @@ func (m *AppLoginModule) apiUpdateTask(c *gin.Context) {
 					glo_coll := qc.Database.Collection(COLL_TASK_GLOBEL)
 					glo_coll.RemoveId(sessCtx, task.Id)
 				}
+			}
+			task.State = util.TASK_STATE_OPEN
+			err := addToPublic(qc, sessCtx, task)
+			if err != nil {
+				util.Log_error("insert task to public err:%s", err.Error())
+				return nil, err
 			}
 			// 更新 task
 			coll := qc.Database.Collection(COLL_TASK)
