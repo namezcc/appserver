@@ -1,6 +1,8 @@
 package util
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"hash/crc32"
 	"strconv"
 	"strings"
@@ -32,4 +34,9 @@ func StringHash(s string) uint32 {
 
 func StringCharLen(s string) int {
 	return len([]rune(s))
+}
+
+func StringMd5(s string) string {
+	mdns := md5.Sum([]byte(s))
+	return hex.EncodeToString(mdns[:])
 }

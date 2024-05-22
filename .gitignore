@@ -3,3 +3,4 @@ goserver/bin/log/
 goserver/bin/upload/
 
 *.exe
+nodeserver/node_modules/

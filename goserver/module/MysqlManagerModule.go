@@ -6,6 +6,7 @@ type MysqlManagerModule struct {
 	modulebase
 	_mysqlmod   []*MysqlWorker
 	_work_index int
+	HostKey     string
 }
 
 const MYSQL_WOKER_NUM = 5
@@ -13,7 +14,11 @@ const MYSQL_WOKER_NUM = 5
 func (m *MysqlManagerModule) Init(*moduleMgr) {
 	m._mysqlmod = make([]*MysqlWorker, 0)
 	m._work_index = 0
-	host := util.GetConfValue("mysql")
+	hkey := m.HostKey
+	if len(hkey) == 0 {
+		hkey = "mysql"
+	}
+	host := util.GetConfValue(hkey)
 	for i := 0; i < MYSQL_WOKER_NUM; i++ {
 		rdm := MysqlWorker{}
 		rdm.Init(host)

@@ -11,17 +11,24 @@ import (
 	"goserver/module"
 	"goserver/util"
 	"hash/crc32"
+	"io"
 	"math/rand"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/gin-gonic/gin"
+	"github.com/go-ego/gse"
 	"github.com/qiniu/qmgo"
 	qmoption "github.com/qiniu/qmgo/options"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"gopkg.in/yaml.v2"
 )
@@ -192,7 +199,7 @@ func Test_defer(t *testing.T) {
 }
 
 func Test_md5(t *testing.T) {
-	md := md5.Sum([]byte("asdjhkl"))
+	md := md5.Sum([]byte("123456"))
 	str := hex.EncodeToString(md[:])
 	fmt.Print(str)
 }
@@ -293,7 +300,7 @@ func Test_json(*testing.T) {
 
 var qmtimeoutms = int64(2000)
 
-func createMongoClient(host string, db string) *qmgo.Client {
+func createMongoClient(host string, _ string) *qmgo.Client {
 	ops := qmoption.ClientOptions{}
 	cli, err := qmgo.NewClient(context.Background(), &qmgo.Config{
 		Uri:              host,
@@ -515,4 +522,138 @@ func Test_list_order(*testing.T) {
 	na.Remove()
 	showListOrder(ol)
 	nb.Remove()
+}
+
+func Test_cutword(*testing.T) {
+	var seg gse.Segmenter
+	seg.LoadDict()
+
+	// str := "test title中文测试 北京大学，我来了"
+	str := "test images中文搜索測試是"
+	// str := "Hello world, Helloworld. Winter is coming! こんにちは世界, 你好世界."
+
+	words := seg.CutSearch(str, true)
+
+	// words := x.CutAll(str)
+	fmt.Println(strings.Join(words, "/"))
+
+}
+
+func Test_vec(*testing.T) {
+	vec := make([]int, 0, 100)
+	fmt.Println("len ", len(vec), vec, cap(vec))
+	for i := 0; i < 10; i++ {
+		vec = append(vec, i)
+	}
+
+	fmt.Println("len ", len(vec), vec, cap(vec))
+	// copy(vec, vec[5:])
+	vec = append(vec[:0], vec[5:]...)
+	fmt.Println("len ", len(vec), vec, cap(vec))
+
+}
+
+func createOfficialMongoClient(host string) *mongo.Client {
+	client, err := mongo.Connect(context.Background(), options.Client().ApplyURI(host))
+	if err != nil {
+		panic(err)
+	}
+	return client
+}
+
+func showIndex(cli *mongo.Client, collname string) {
+	coll := cli.Database("test").Collection(collname)
+	opts := options.ListIndexes()
+	cursor, err := coll.Indexes().List(context.Background(), opts)
+	if err != nil {
+		fmt.Println("Error in getting indexes:", err)
+		return
+	}
+
+	// 用于存储索引数据的变量
+	var indexes []bson.M
+	if err = cursor.All(context.Background(), &indexes); err != nil {
+		fmt.Println("Error in decoding indexes:", err)
+	}
+
+	// 打印所有索引
+	for _, index := range indexes {
+		fmt.Println(index)
+	}
+}
+
+func creatIndex(cli *mongo.Client, collname string, models []mongo.IndexModel) {
+	coll := cli.Database("test").Collection(collname)
+	_, err := coll.Indexes().CreateMany(context.Background(), models)
+	if err != nil {
+		fmt.Println(err.Error())
+	}
+}
+
+func Test_Index(*testing.T) {
+	cli := createOfficialMongoClient("mongodb://localhost:27017")
+
+	indexloc := mongo.IndexModel{
+		Keys: bson.D{{Key: "location", Value: "2dsphere"}},
+	}
+	indexTitle := mongo.IndexModel{
+		Keys: bson.D{{Key: "title", Value: "text"}},
+	}
+	indexUpdate := mongo.IndexModel{
+		Keys:    bson.D{{Key: "updateAt", Value: 1}},
+		Options: options.Index().SetExpireAfterSeconds(0),
+	}
+	creatIndex(cli, "test_index", []mongo.IndexModel{indexloc, indexTitle, indexUpdate})
+	// showIndex(cli, "task_location")
+	showIndex(cli, "test_index")
+}
+
+func Test_chan(*testing.T) {
+	ichan := make(chan int, 10)
+
+	go func() {
+		for i := 0; i < 20; i++ {
+			ichan <- i
+		}
+		fmt.Print("chan out")
+		close(ichan)
+	}()
+
+	time.Sleep(time.Duration(2) * time.Second)
+	for i := 0; i < 20; i++ {
+		<-ichan
+	}
+	fmt.Print("close chan")
+}
+
+func Test_http_get(*testing.T) {
+	url := "https://api.weixin.qq.com/cgi-bin/stable_token"
+
+	pdata, err := json.Marshal(gin.H{
+		"grant_type": "client_credential",
+		// "appid":      "wxf37907f7775402c1",
+		"appid":  "wxf37907f7775402c2",
+		"secret": "99b065eb61791706ef31096b2a561332",
+	})
+	if err != nil {
+		fmt.Println(err.Error())
+		return
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewReader(pdata))
+	if err != nil {
+		fmt.Println(err.Error())
+		return
+	}
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return
+	} else {
+		msg, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return
+		}
+		fmt.Println(string(msg))
+	}
 }

@@ -28,6 +28,7 @@ type Tcpconn struct {
 	_onClose  onClose
 	_type     int
 	_udata    interface{}
+	_have_err bool
 }
 
 type ReadCallBack func(int, int, []byte, *net.Conn)
@@ -41,6 +42,7 @@ func newTcpconn(id int, conn net.Conn, _c onClose, _ct int) *Tcpconn {
 	_tc._close = false
 	_tc._onClose = _c
 	_tc._type = _ct
+	_tc._have_err = false
 
 	go func() {
 		for s := range _tc._sendchan {
@@ -49,6 +51,8 @@ func newTcpconn(id int, conn net.Conn, _c onClose, _ct int) *Tcpconn {
 				break
 			}
 		}
+		// 设置报错，清空chan
+		_tc.clearSendChan()
 
 		if !_tc._close {
 			_tc._onClose(_tc._connId)
@@ -56,6 +60,13 @@ func newTcpconn(id int, conn net.Conn, _c onClose, _ct int) *Tcpconn {
 	}()
 
 	return _tc
+}
+
+func (_tc *Tcpconn) clearSendChan() {
+	_tc._have_err = true
+	if len(_tc._sendchan) > 0 {
+		<-_tc._sendchan
+	}
 }
 
 func (_tc *Tcpconn) StartRead(_call ReadCallBack) {
@@ -89,6 +100,8 @@ func (_tc *Tcpconn) StartRead(_call ReadCallBack) {
 			_call(_tc._connId, int(mid), buff, &_tc._conn)
 		}
 
+		// 设置报错，清空chan
+		_tc.clearSendChan()
 		if !_tc._close {
 			_tc._onClose(_tc._connId)
 		}
@@ -96,6 +109,9 @@ func (_tc *Tcpconn) StartRead(_call ReadCallBack) {
 }
 
 func (_tc *Tcpconn) Write(b []byte) {
+	if _tc._have_err {
+		return
+	}
 	_tc._sendchan <- b
 }
 

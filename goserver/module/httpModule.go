@@ -28,6 +28,8 @@ type msgResponse struct {
 	_id      int
 }
 
+type SqlxDbCall func(*sqlx.DB)
+
 type httpBase interface {
 	initRoter(*gin.Engine)
 	getRedisLock() *sync.Mutex
@@ -40,6 +42,7 @@ type HttpModule struct {
 	_rsp_index_lock sync.Mutex
 	_net_mod        *netModule
 	_sql            *sqlx.DB
+	_sql_lock       sync.Mutex
 	_httpbase       httpBase
 	_gin            *gin.Engine
 	_host           string
@@ -75,6 +78,9 @@ func (m *HttpModule) SetMysqlHots(h string) {
 }
 
 func (m *HttpModule) InitSql() {
+	if len(m._mysql_host) == 0 {
+		return
+	}
 	host := util.GetConfValue(m._mysql_host)
 	sql, sqlerr := sqlx.Open("mysql", host)
 	m._sql = sql
@@ -89,6 +95,12 @@ func (m *HttpModule) InitSql() {
 	sql.SetMaxIdleConns(20)
 	// 最大连接周期
 	sql.SetConnMaxLifetime(100 * time.Second)
+}
+
+func (m *HttpModule) doSql(f SqlxDbCall) {
+	m._sql_lock.Lock()
+	defer m._sql_lock.Unlock()
+	f(m._sql)
 }
 
 func (m *HttpModule) initRedis() {

@@ -17,6 +17,7 @@ type Wsconn struct {
 	_type      int
 	_udata     interface{}
 	_read_data []byte
+	_have_err  bool
 }
 
 func newWsconn(id int, conn net.Conn, _c onClose, _ct int) *Wsconn {
@@ -28,6 +29,7 @@ func newWsconn(id int, conn net.Conn, _c onClose, _ct int) *Wsconn {
 	_tc._onClose = _c
 	_tc._type = _ct
 	_tc._read_data = make([]byte, 0, 1024)
+	_tc._have_err = false
 
 	go func() {
 		for s := range _tc._sendchan {
@@ -38,6 +40,8 @@ func newWsconn(id int, conn net.Conn, _c onClose, _ct int) *Wsconn {
 				break
 			}
 		}
+		// 设置报错，清空chan
+		_tc.clearSendChan()
 
 		if !_tc._close {
 			_tc._onClose(_tc._connId)
@@ -45,6 +49,13 @@ func newWsconn(id int, conn net.Conn, _c onClose, _ct int) *Wsconn {
 	}()
 
 	return _tc
+}
+
+func (_tc *Wsconn) clearSendChan() {
+	_tc._have_err = true
+	if len(_tc._sendchan) > 0 {
+		<-_tc._sendchan
+	}
 }
 
 func (_tc *Wsconn) StartRead(_call ReadCallBack) {
@@ -89,6 +100,8 @@ func (_tc *Wsconn) StartRead(_call ReadCallBack) {
 				_tc._read_data = append(_tc._read_data[:0], _tc._read_data[readlen:]...)
 			}
 		}
+		// 设置报错，清空chan
+		_tc.clearSendChan()
 		if !_tc._close {
 			_tc._onClose(_tc._connId)
 		}
@@ -96,6 +109,9 @@ func (_tc *Wsconn) StartRead(_call ReadCallBack) {
 }
 
 func (_tc *Wsconn) Write(b []byte) {
+	if _tc._have_err {
+		return
+	}
 	_tc._sendchan <- b
 }
 

@@ -28,42 +28,46 @@ type JWTClaims struct { // token里面添加用户信息，验证token后可能�
 }
 
 var (
-	Secret     = "LiuBei"  // 加盐
-	ExpireTime = 3600 * 24 // token有效期
+	Secret            = "LiuBei"  // 加盐
+	ExpireTime        = 3600      //3600 * 24     // token有效期
+	ExpireRefreshTime = 3600 * 24 //3600 * 24 * 2 // refresh token有效期
 )
 
-func Verify(c *gin.Context) (result bool, userName string, err error) {
+func Verify(c *gin.Context) (bool, *JWTClaims) {
 	strToken := c.Request.Header.Get("Authorization")
 	if strToken == "" {
-		result = false
-		return result, "", nil
+		return false, nil
 	}
 	claim, err := verifyAction(strToken)
 	if err != nil {
-		result = false
 		util.Log_error("verify err:%s", err.Error())
-		return result, "", nil
+		return false, nil
 	}
-	result = true
-	userName = claim.Username
-	return result, userName, nil
+	return true, claim
 }
 
 // 刷新token
-func Refresh(c *gin.Context) {
+func Refresh(c *gin.Context) (string, string) {
 	strToken := c.Request.Header.Get("Authorization")
 	claims, err := verifyAction(strToken)
 	if err != nil {
-		c.JSON(400, gin.H{"err": err.Error()})
-		return
+		util.Log_error("token refresh %s", err.Error())
+		return "", ""
 	}
-	claims.ExpiresAt = time.Now().Unix() + (claims.ExpiresAt - claims.IssuedAt)
+
+	claims.ExpiresAt = time.Now().Add(time.Second * time.Duration(ExpireTime)).Unix()
 	signedToken, err := getToken(claims)
 	if err != nil {
-		c.JSON(400, gin.H{"err": err.Error()})
-		return
+		util.Log_error("token refresh %s", err.Error())
+		return "", ""
 	}
-	c.JSON(200, gin.H{"data": signedToken})
+	claims.ExpiresAt = time.Now().Add(time.Second * time.Duration(ExpireRefreshTime)).Unix()
+	refreshToken, err := getToken(claims)
+	if err != nil {
+		util.Log_error("token refresh %s", err.Error())
+		return "", ""
+	}
+	return signedToken, refreshToken
 }
 
 // 验证token是否存在，存在则获取信息
@@ -125,11 +129,7 @@ func (m *MasterHttpModule) getMiddlew() gin.HandlerFunc {
 			return
 		}
 
-		checkUser, _, err := Verify(c) //第二个值是用户名，这里没有使用
-		if err != nil {
-			c.JSON(400, gin.H{"err": err.Error()})
-			c.Abort()
-		}
+		checkUser, _ := Verify(c) //第二个值是用户名，这里没有使用
 		if checkUser == false {
 			c.JSON(400, gin.H{"err": "身份认证失败"})
 			c.Abort()
@@ -252,6 +252,7 @@ type userInfo struct {
 }
 
 type dbAdmin struct {
+	Uid  int    `db:"uid" json:"uid"`
 	Name string `db:"name" json:"name"`
 	Pass string `db:"pass" json:"pass"`
 }

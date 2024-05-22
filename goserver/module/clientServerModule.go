@@ -17,8 +17,9 @@ import (
 	"gorm.io/gorm"
 )
 
-const PING_OUT_TIME = 300    //30
-const MAX_TASK_TALK_NUM = 15 //保留500条聊天,>=2倍则删除一半
+const PING_OUT_TIME = 300     //30
+const MAX_TASK_TALK_NUM = 15  //保留500条聊天,>=2倍则删除一半
+const MAX_USER_CHAT_NUM = 100 //保留500条聊天,>=2倍则删除一半
 
 const (
 	CHAT_TYPE_BEGIN = iota
@@ -82,6 +83,7 @@ func (m *ClientServerModule) Init(mgr *moduleMgr) {
 	handle.Handlemsg.AddMsgCall(handle.M_ON_TASK_JOIN_UPDATE, m.onUpdateTaskJoin)
 	handle.Handlemsg.AddMsgCall(handle.M_ON_TASK_NO_CHAT, m.onTaskNoChat)
 	handle.Handlemsg.AddMsgCall(handle.M_ON_TASK_DELETE, m.onTaskDelete)
+	handle.Handlemsg.AddMsgCall(handle.M_ON_TASK_KICK, m.onTaskBeKick)
 
 	handle.Handlemsg.AddMsgCall(handle.N_CM_LOGIN, m.onClientLogin)
 	handle.Handlemsg.AddMsgCall(handle.N_CM_PING, m.onClientPing)
@@ -91,6 +93,7 @@ func (m *ClientServerModule) Init(mgr *moduleMgr) {
 
 	handle.Handlemsg.AddMsgCall(handle.N_CM_CHAT_USER, m.onClientChatUser)
 	handle.Handlemsg.AddMsgCall(handle.N_CM_CHAT_USER_GET, m.onClientChatUserGet)
+	handle.Handlemsg.AddMsgCall(handle.N_CM_CHAT_USER_READ, m.onClientChatUserRead)
 }
 
 func (m *ClientServerModule) AfterInit() {
@@ -256,8 +259,9 @@ func (m *ClientServerModule) onClientLogin(msg *handle.BaseMsg) {
 		user:     buser,
 	}
 	m.addUser(&user)
-	m.sendUserTaskChatIndex(&user)
 	m.sendUserTaskChatRead(&user)
+	m.sendUserTaskChatIndex(&user)
+	m.sendUserChatRead(&user)
 	m.loadUserChat(&user)
 	util.Log_info("app user login connid:%d cid:%d phone:%s", user.connid, user.cid, user.Phone)
 }
@@ -410,6 +414,14 @@ func (m *ClientServerModule) onTaskDelete(msg *handle.BaseMsg) {
 	}
 }
 
+func (m *ClientServerModule) onTaskBeKick(msg *handle.BaseMsg) {
+	j := msg.Data.(*mg_task_join)
+	um := m.getUserByCid(j.Cid)
+	if um != nil {
+		m.sendClientJson(um.connid, handle.SM_TASK_BE_KICK, j)
+	}
+}
+
 func (m *ClientServerModule) getTaskChat(taskid primitive.ObjectID) *mg_task_chat {
 	c, ok := m._task_chat[taskid.Hex()]
 	if !ok {
@@ -540,11 +552,11 @@ func (m *ClientServerModule) onClientTaskChat(msg *handle.BaseMsg) {
 		if v.Cid == taskchat.Cid {
 			havemaster = true
 		}
-		if v.NoChat <= 0 {
-			tu := m.getUserByCid(v.Cid)
-			if tu != nil {
-				connids = append(connids, tu.connid)
-			}
+		// if v.NoChat <= 0 {
+		// }
+		tu := m.getUserByCid(v.Cid)
+		if tu != nil {
+			connids = append(connids, tu.connid)
 		}
 	}
 	if !havemaster {
@@ -562,7 +574,7 @@ func (m *ClientServerModule) onClientTaskChat(msg *handle.BaseMsg) {
 func getTaskChatPipline(taskid primitive.ObjectID, istart int, num int) primitive.A {
 	pipline := bson.A{
 		bson.M{"$match": bson.M{"_id": taskid}},
-		bson.M{"$project": bson.M{"index": 1, "data": bson.M{"$slice": bson.A{
+		bson.M{"$project": bson.M{"index": 1, "count": 1, "data": bson.M{"$slice": bson.A{
 			"$data",
 			istart,
 			num,
@@ -623,7 +635,9 @@ func (m *ClientServerModule) getTaskChatIndex(cid int) []mg_task_chat {
 			{Key: "localField", Value: "tasklist._id"},
 			{Key: "foreignField", Value: "_id"},
 			{Key: "pipeline", Value: bson.A{
-				bson.M{"$project": bson.M{"count": 1, "index": 1}},
+				bson.M{"$project": bson.M{"count": 1, "index": 1,
+					"data": bson.M{"$slice": bson.A{"$data", -1, 1}},
+				}},
 			}},
 			{Key: "as", Value: "result"},
 		},
@@ -663,10 +677,28 @@ type b_task_chat_read struct {
 	Index  int    `json:"index"`
 }
 
+type b_user_chat_read struct {
+	Cid   int64 `gorm:"primaryKey" json:"cid"`
+	Tocid int64 `gorm:"primaryKey;column:tocid" json:"tocid"`
+	Index int   `json:"index"`
+}
+
 func (m *ClientServerModule) getUserTaskChatRead(u *appUserInfo) []b_task_chat_read {
 	var read []b_task_chat_read
 	m._sql_mgr.RequestFuncCallHash(uint32(u.cid), func(d *gorm.DB) interface{} {
 		res := d.Table("b_task_chat_read").Find(&read, u.cid)
+		if res.Error != nil {
+			util.Log_error("select task read %s", res.Error.Error())
+		}
+		return nil
+	})
+	return read
+}
+
+func (m *ClientServerModule) getUserChatRead(u *appUserInfo) []b_user_chat_read {
+	var read []b_user_chat_read
+	m._sql_mgr.RequestFuncCallHash(uint32(u.cid), func(d *gorm.DB) interface{} {
+		res := d.Table("b_user_chat_read").Find(&read, u.cid)
 		if res.Error != nil {
 			util.Log_error("select task read %s", res.Error.Error())
 		}
@@ -683,15 +715,30 @@ func (m *ClientServerModule) sendUserTaskChatRead(u *appUserInfo) {
 	m.sendClientJson(u.connid, handle.SM_CHAT_READ, vec)
 }
 
+func (m *ClientServerModule) sendUserChatRead(u *appUserInfo) {
+	vec := m.getUserChatRead(u)
+	if vec == nil {
+		vec = make([]b_user_chat_read, 0)
+	}
+	m.sendClientJson(u.connid, handle.SM_CHAT_USER_READ, vec)
+}
+
 func (m *ClientServerModule) onTaskChatRead(msg *handle.BaseMsg) {
 	um := msg.Data.(*userMsg)
-	taskstrid := um.msg.ReadString()
-	index := um.msg.ReadInt32()
+	num := int(um.msg.ReadInt32())
+	var idvec [][]byte
+	var indexvec []int32
+	for i := 0; i < num; i++ {
+		idvec = append(idvec, um.msg.ReadString())
+		indexvec = append(indexvec, um.msg.ReadInt32())
+	}
 
 	m._sql_mgr.RequestFuncCallNoResHash(uint32(um.user.cid), func(d *gorm.DB) {
-		res := d.Exec("INSERT INTO `b_task_chat_read` VALUES(?,?,?) ON DUPLICATE KEY UPDATE `index`=?;", um.user.cid, taskstrid, index, index)
-		if res.Error != nil {
-			util.Log_error("update task read %s", res.Error.Error())
+		for i := 0; i < len(idvec); i++ {
+			res := d.Exec("INSERT INTO `b_task_chat_read` VALUES(?,?,?) ON DUPLICATE KEY UPDATE `index`=?;", um.user.cid, idvec[i], indexvec[i], indexvec[i])
+			if res.Error != nil {
+				util.Log_error("update task read %s", res.Error.Error())
+			}
 		}
 	})
 }
@@ -720,7 +767,7 @@ func (m *ClientServerModule) onClientChatUser(msg *handle.BaseMsg) {
 		return
 	}
 
-	if chat.ContentType <= CHAT_TYPE_BEGIN || chat.ContentType >= CHAT_TYPE_END || len(chat.Content) > 1000 ||
+	if chat.ContentType <= CHAT_TYPE_BEGIN || chat.ContentType >= CHAT_TYPE_END || len(chat.Content) > 5000 ||
 		chat.Tocid <= 0 {
 		return
 	}
@@ -734,19 +781,19 @@ func (m *ClientServerModule) onClientChatUser(msg *handle.BaseMsg) {
 	chat.Chatid = util.GetMillisecond()
 
 	// 插入数据库
-	res := m._mg_mgr.RequestFuncCall(func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
-		// 是否黑名单
-		if checkInBlackList(qc, ctx, chat.Tocid, user.cid) {
-			return false
-		}
+	// res := m._mg_mgr.RequestFuncCall(func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
+	// 	// 是否黑名单
+	// 	if checkInBlackList(qc, ctx, chat.Tocid, user.cid) {
+	// 		return false
+	// 	}
 
-		coll := qc.Database.Collection(COLL_CHAT_USER)
-		_, err := coll.InsertOne(ctx, chat)
-		if err != nil {
-			util.Log_error("user chat err:%s", err.Error())
-		}
-		return true
-	}).(bool)
+	// 	coll := qc.Database.Collection(COLL_CHAT_USER)
+	// 	_, err := coll.InsertOne(ctx, chat)
+	// 	if err != nil {
+	// 		util.Log_error("user chat err:%s", err.Error())
+	// 	}
+	// 	return true
+	// }).(bool)
 
 	uchat := Mg_chat{
 		Cid:         user.cid,
@@ -769,7 +816,12 @@ func (m *ClientServerModule) onClientChatUser(msg *handle.BaseMsg) {
 		Cidlow:   cidlow,
 		UpdateAt: uchat.SendTime,
 	}
-	m._mg_mgr.RequestFuncCall(func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
+	res := m._mg_mgr.RequestFuncCall(func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
+		// 是否黑名单
+		if checkInBlackList(qc, ctx, chat.Tocid, user.cid) {
+			return false
+		}
+
 		coll := qc.Database.Collection(COLL_CHAT_USER_LIST)
 		coll.Find(ctx, bson.M{"cidhei": cidhei, "cidlow": cidlow}).Select(bson.M{"_id": 1, "count": 1, "indexid": 1}).One(&chatlist)
 
@@ -786,17 +838,27 @@ func (m *ClientServerModule) onClientChatUser(msg *handle.BaseMsg) {
 			}
 		} else {
 			// 更新
-			err := coll.UpdateOne(ctx, bson.M{"_id": chatlist.Id}, bson.M{"$set": bson.M{"indexid": chatlist.Indexid, "count": chatlist.Count}, "$push": bson.M{"data": uchat}})
+			err := coll.UpdateOne(ctx, bson.M{"_id": chatlist.Id}, bson.M{"$set": bson.M{"indexid": chatlist.Indexid, "count": chatlist.Count, "updateat": chatlist.UpdateAt}, "$push": bson.M{"data": uchat}})
 			if err != nil {
 				util.Log_error("insert chat user list err:%s", err.Error())
 			}
 		}
 		// 删除旧的记录
-		if chatlist.Count >= 200 {
-
+		if chatlist.Count >= MAX_USER_CHAT_NUM*2 {
+			var tchat mg_chat_user_list
+			pip := getTaskChatPipline(chatlist.Id, -MAX_USER_CHAT_NUM, MAX_USER_CHAT_NUM)
+			err = coll.Aggregate(ctx, pip).One(&tchat)
+			if err == nil {
+				// 写回
+				tchat.Count = len(tchat.Data)
+				err = coll.UpdateOne(ctx, bson.M{"_id": tchat.Id}, bson.M{"$set": bson.M{"data": tchat.Data, "count": tchat.Count}})
+				if err == nil {
+					chatlist.Count = tchat.Count
+				}
+			}
 		}
 		return true
-	})
+	}).(bool)
 
 	if res {
 		// 同步
@@ -841,5 +903,25 @@ func (m *ClientServerModule) onClientChatUserGet(msg *handle.BaseMsg) {
 	m._mg_mgr.RequestFuncCallNoRes(func(ctx context.Context, qc *qmgo.QmgoClient) {
 		coll := qc.Database.Collection(COLL_CHAT_USER)
 		coll.RemoveAll(ctx, bson.M{"tocid": um.user.cid, "chatid": bson.M{"$gte": lowid, "$lte": heighid}})
+	})
+}
+
+func (m *ClientServerModule) onClientChatUserRead(msg *handle.BaseMsg) {
+	um := msg.Data.(*userMsg)
+	num := um.msg.ReadInt32()
+	var cidvec []int64
+	var indexvec []int32
+	for i := 0; i < int(num); i++ {
+		cidvec = append(cidvec, um.msg.ReadInt64())
+		indexvec = append(indexvec, um.msg.ReadInt32())
+	}
+
+	m._sql_mgr.RequestFuncCallNoResHash(uint32(um.user.cid), func(d *gorm.DB) {
+		for i := 0; i < len(cidvec); i++ {
+			res := d.Exec("INSERT INTO `b_user_chat_read` VALUES(?,?,?) ON DUPLICATE KEY UPDATE `index`=?;", um.user.cid, cidvec[i], indexvec[i], indexvec[i])
+			if res.Error != nil {
+				util.Log_error("update user chat read err: %s", res.Error.Error())
+			}
+		}
 	})
 }

@@ -1,6 +1,7 @@
 package module
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"goserver/handle"
 	"goserver/util"
 	"hash/crc32"
+	"io"
 	"math/rand"
 	"net/http"
 	"os"
@@ -46,10 +48,12 @@ const (
 	COLL_TASK_GLOBEL      = "task_globel"      //全服任务
 	COLL_TASK_LOCATION    = "task_location"    //本地任务
 	COLL_CHAT_USER_LIST   = "chat_user_list"   //聊天缓存
+	COLL_SUGGEST          = "user_suggest"     //建议
 )
 
 const (
 	MAX_USER_INTEREST = 100
+	CREDIT_SCORE_BASE = 100
 )
 
 type JsonStringList struct {
@@ -225,6 +229,7 @@ func (m *AppLoginModule) Init(mgr *moduleMgr) {
 	m.HttpModule.Init(mgr)
 	m._httpbase = m
 	m.SetHost(":" + util.GetConfValue("hostport"))
+	m.SetMysqlHots("")
 	m._safe_req = make(map[string]bool)
 	m._redis_mgr = mgr.GetModule(MOD_REDIS_MGR).(*RedisManagerModule)
 	m._sql_mgr = mgr.GetModule(MOD_MYSQL_MGR).(*MysqlManagerModule)
@@ -251,7 +256,7 @@ func (m *AppLoginModule) getMiddlew() gin.HandlerFunc {
 
 		checkUser, userPhone, userId := AppVerify(c) //第二个值是用户名，这里没有使用
 		if checkUser == false {
-			c.JSON(http.StatusUnauthorized, gin.H{"code": 0, "msg": "身份认证失败"})
+			c.JSON(http.StatusUnauthorized, gin.H{"code": util.ERRCODE_UNAUTHORIZED, "msg": "身份认证失败"})
 			c.Abort()
 			return
 		}
@@ -296,9 +301,13 @@ func (m *AppLoginModule) initRoter(r *gin.Engine) {
 
 	m.safeGet(r, "/phoneCode", m.phoneCode)
 	m.safePost(r, "/userlogin", m.userLogin)
+	m.safePost(r, "/userloginWxCode", m.userloginWxCode)
 
-	r.GET("/getUserInfo", m.apiGetUserInfo)
-	r.POST("/apiGetUserList", m.apiGetUserList)
+	m.safeGet(r, "/getUserInfo", m.apiGetUserInfo)
+	r.GET("/getSelfUserInfo", m.getSelfUserInfo)
+	m.safePost(r, "/apiGetUserList", m.apiGetUserList)
+	// r.POST("/apiGetUserList", m.apiGetUserList)
+
 	r.GET("/userRefreshToken", m.userRefreshToken)
 	r.POST("/apiCreateTask", m.apiCreateTask)
 	r.POST("/apiUpdateTask", m.apiUpdateTask)
@@ -307,6 +316,7 @@ func (m *AppLoginModule) initRoter(r *gin.Engine) {
 	m.safeGet(r, "/apiGetOneTaskInfo", m.apiGetOneTaskInfo)
 
 	r.GET("/apiLoadMyTaskInfo", m.apiLoadMyTaskInfo)
+	r.GET("/apiLoadOtherTaskInfo", m.apiLoadOtherTaskInfo)
 	r.GET("/apiLoadMyJoinTaskInfo", m.apiLoadMyJoinTaskInfo)
 	r.GET("/apiDeleteMyTaskInfo", m.apiDeleteMyTaskInfo)
 
@@ -324,17 +334,19 @@ func (m *AppLoginModule) initRoter(r *gin.Engine) {
 	r.GET("/apiGetTaskCost", m.apiGetTaskCost)
 
 	r.GET("/apiEditName", m.apiEditName)
-	r.GET("/apiEditSex", m.apiEditSex)
+	// r.GET("/apiEditSex", m.apiEditSex)
 	r.POST("/apiSetUserIcon", m.apiSetUserIcon)
 
 	r.POST("/apiReportTask", m.apiReportTask)
 	r.POST("/apiReportUser", m.apiReportUser)
+	m.safePost(r, "/apiUserSuggest", m.apiUserSuggest)
 
 	r.GET("/apiPushBlackList", m.apiPushBlackList)
 	r.GET("/apiPullBlackList", m.apiPullBlackList)
 	r.GET("/apiGetBlackList", m.apiGetBlackList)
 
-	m.safePost(r, "/apiSearchTask", m.apiSearchTask)
+	// m.safePost(r, "/apiSearchTask", m.apiSearchTask)
+	r.POST("/apiSearchTask", m.apiSearchTask)
 
 	r.GET("/apiTaskPushInterest", m.apiTaskPushInterest)
 	r.GET("/apiTaskPullInterest", m.apiTaskPullInterest)
@@ -342,14 +354,19 @@ func (m *AppLoginModule) initRoter(r *gin.Engine) {
 	r.GET("/apiLoadInterestTask", m.apiLoadInterestTask)
 
 	m.safePost(r, "/apiAppCrash", m.apiAppCrash)
+	m.safePost(r, "/apiAppError", m.apiAppError)
 	m.safePost(r, "/apiTaskCheck", m.apiTaskCheck)
 	m.safeGet(r, "/apiTaskCheckAll", m.apiTaskCheckAll)
 
 	r.GET("/apiLoadTaskChat", m.apiLoadTaskChat)
 	r.GET("/apiLoadUserChatList", m.apiLoadUserChatList)
 	r.GET("/apiLoadUserChatData", m.apiLoadUserChatData)
+	r.GET("/apiLoadOneUserChatData", m.apiLoadOneUserChatData)
 	r.GET("/apiDeleteUserChatData", m.apiDeleteUserChatData)
 
+	r.GET("/apiGetCreditToUserType", m.apiGetCreditToUserType)
+	r.GET("/apiSetCreditToUserType", m.apiSetCreditToUserType)
+	r.GET("/apiCheckIdCard", m.apiCheckIdCard)
 }
 
 const UID_START_TIME = 1675612800
@@ -432,7 +449,7 @@ func (m *AppLoginModule) phoneCode(c *gin.Context) {
 	code := rand.Intn(899999) + 100000
 	codeinfo.Code = strconv.Itoa(code)
 	// 60s 过期
-	codeinfo.Time = util.GetSecond() + 60
+	codeinfo.Time = util.GetSecond() + 30
 	infostr, err := json.Marshal(codeinfo)
 	if err != nil {
 		util.Log_error("phonecode json %s", err.Error())
@@ -451,8 +468,8 @@ func (m *AppLoginModule) phoneCode(c *gin.Context) {
 }
 
 type userLoginData struct {
-	Phone string `json:"phone"`
-	Code  string `json:"code"`
+	Phone string `json:"phone,omitempty"`
+	Code  string `json:"code,omitempty"`
 }
 
 // 生成随机8个英文字符的字符串
@@ -470,84 +487,129 @@ func generateRandomString() string {
 func (m *AppLoginModule) userLogin(c *gin.Context) {
 	var info userLoginData
 	err := c.ShouldBindJSON(&info)
-
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"code": 0, "msg": err.Error()})
+		util.Log_error("userLogin json err:%s", err.Error())
+		ResponesCommonError(c, "数据错误")
 		return
 	}
 
-	codestr := ""
-	hashval := crc32.ChecksumIEEE([]byte(info.Phone))
-	m._redis_mgr.RequestRedisFuncCallNoResHash(hashval, func(ctx context.Context, _rdb *redis.Client) {
-		rs := _rdb.HGet(ctx, RedisPhoneCodeKey, info.Phone)
-		codestr, err = rs.Result()
-		if err != nil {
-			util.Log_error(err.Error())
-		}
+	if len(info.Phone) == 0 {
+		ResponesCommonError(c, "数据错误")
+		return
+	}
+	// 检查是否测试账号
+
+	m.userRealLogin(c, info.Phone)
+}
+
+type UserPhoneRes struct {
+	Errcode     int    `json:"errcode,omitempty"`
+	Errmsg      string `json:"errmsg,omitempty"`
+	PhoneNumber string `json:"phoneNumber,omitempty"`
+}
+
+func (m *AppLoginModule) userloginWxCode(c *gin.Context) {
+	var info userLoginData
+	err := c.ShouldBindJSON(&info)
+	if err != nil {
+		util.Log_error("userWxLogin json err:%s", err.Error())
+		ResponesCommonError(c, "数据错误")
+		return
+	}
+
+	if len(info.Code) == 0 {
+		ResponesCommonError(c, "数据错误")
+		return
+	}
+
+	url := util.GetConfValue("nodeServerHost") + "getPhoneNumber"
+	pdata, err := json.Marshal(gin.H{
+		"code": info.Code,
 	})
-
-	if codestr == "" {
-		c.JSON(http.StatusOK, gin.H{"code": 1, "msg": "not gen code"})
-		return
-	}
-
-	codeinfo := phoneCodeInfo{}
-	err = json.Unmarshal([]byte(codestr), &codeinfo)
 	if err != nil {
-		util.Log_error("userLogin %s", err.Error())
-		c.JSON(http.StatusOK, gin.H{"code": 1, "msg": "server error"})
+		util.Log_error("userWxLogin step 1 err:%s", err.Error())
+		ResponesCommonError(c, "服务器错误")
 		return
 	}
 
-	if codeinfo.Time+4*60 < util.GetSecond() {
-		c.JSON(http.StatusOK, gin.H{"code": 1, "msg": "code out time"})
+	req, err := http.NewRequest("POST", url, bytes.NewReader(pdata))
+	if err != nil {
+		util.Log_error("userWxLogin step 2 err:%s", err.Error())
+		ResponesCommonError(c, "服务器错误")
+		return
+	}
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		util.Log_error("userWxLogin step 3 err:%s", err.Error())
+		ResponesCommonError(c, "服务器错误")
 		return
 	}
 
-	if codeinfo.Code == info.Code {
-		// 查询账号
-		userId := int64(0)
-		m._sql_mgr.RequestFuncCallNoResHash(hashval, func(d *gorm.DB) {
-			var buser b_user
-			sqlres := d.Select("cid", "phone").Find(&buser, "phone = ?", info.Phone)
-			// 创建账号
+	msg, err := io.ReadAll(resp.Body)
+	if err != nil {
+		util.Log_error("userWxLogin step 4 err:%s", err.Error())
+		ResponesCommonError(c, "服务器错误")
+		return
+	}
+	var userPhone UserPhoneRes
+	err = json.Unmarshal(msg, &userPhone)
+	if err != nil {
+		util.Log_error("userWxLogin step 5 err:%s", err.Error())
+		ResponesCommonError(c, "服务器错误")
+	} else {
+		if len(userPhone.PhoneNumber) == 0 {
+			util.Log_error("userWxLogin step 6 code:%d err:%s", userPhone.Errcode, userPhone.Errmsg)
+			ResponesCommonError(c, "手机号获取失败")
+		} else {
+			// ResponesJsonData(c, userPhone)
+			m.userRealLogin(c, userPhone.PhoneNumber)
+		}
+	}
+}
+
+func (m *AppLoginModule) userRealLogin(c *gin.Context, phoneNumber string) {
+	hashval := crc32.ChecksumIEEE([]byte(phoneNumber))
+	// 查询账号
+	userId := int64(0)
+	m._sql_mgr.RequestFuncCallNoResHash(hashval, func(d *gorm.DB) {
+		var buser b_user
+		sqlres := d.Select("cid", "phone").Find(&buser, "phone = ?", phoneNumber)
+		// 创建账号
+		if sqlres.Error != nil {
+			util.Log_error("select user error %s", sqlres.Error.Error())
+			return
+		}
+		if buser.Cid == 0 {
+			buser.Cid = m.genUserId()
+			buser.Phone = phoneNumber
+			buser.Name = generateRandomString()
+			sqlres := d.Create(&buser)
 			if sqlres.Error != nil {
-				util.Log_error("select user error %s", sqlres.Error.Error())
+				util.Log_error("create user error %s", sqlres.Error.Error())
 				return
 			}
-			if buser.Cid == 0 {
-				buser.Cid = m.genUserId()
-				buser.Phone = info.Phone
-				buser.Name = generateRandomString()
-				sqlres := d.Create(&buser)
-				if sqlres.Error != nil {
-					util.Log_error("create user error %s", sqlres.Error.Error())
-					return
-				}
-			}
-			userId = buser.Cid
-		})
+		}
+		userId = buser.Cid
+	})
 
-		if userId == 0 {
-			c.JSON(http.StatusOK, gin.H{"code": 1, "msg": "account error"})
-			return
-		}
-
-		claims := &AppJWTClaims{
-			UserID: userId,
-			Phone:  info.Phone,
-		}
-		claims.IssuedAt = time.Now().Unix()
-		claims.ExpiresAt = time.Now().Add(time.Second * time.Duration(AppExpireTime)).Unix()
-		signedToken, err := AppGetToken(claims)
-		if err != nil {
-			c.JSON(http.StatusOK, gin.H{"code": 1, "msg": err.Error()})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"code": 0, "msg": "ok", "data": signedToken})
-	} else {
-		c.JSON(http.StatusOK, gin.H{"code": 1, "msg": "验证码错误"})
+	if userId == 0 {
+		ResponesError(c, util.USER_HTTP_ERR_ERROR, "account error")
+		return
 	}
+
+	claims := &AppJWTClaims{
+		UserID: userId,
+		Phone:  phoneNumber,
+	}
+	claims.IssuedAt = time.Now().Unix()
+	claims.ExpiresAt = time.Now().Add(time.Second * time.Duration(AppExpireTime)).Unix()
+	signedToken, err := AppGetToken(claims)
+	if err != nil {
+		ResponesError(c, util.USER_HTTP_ERR_ERROR, err.Error())
+		return
+	}
+	ResponesJsonData(c, gin.H{"token": signedToken})
 }
 
 func (m *AppLoginModule) userRefreshToken(c *gin.Context) {
@@ -560,13 +622,15 @@ func (m *AppLoginModule) userRefreshToken(c *gin.Context) {
 }
 
 type b_user struct {
-	Cid   int64  `gorm:"primaryKey" json:"cid"`
-	Phone string `json:"phone"`
-	Name  string `json:"name"`
-	Sex   int    `json:"sex"`
-	Icon  string `json:"icon"`
-	Birth string `json:"birth"`
-	Money int    `json:"money"`
+	Cid         int64  `gorm:"primaryKey" json:"cid"`
+	Phone       string `json:"phone"`
+	Name        string `json:"name"`
+	Sex         int    `json:"sex"`
+	Icon        string `json:"icon"`
+	Birth       string `json:"birth"`
+	Money       int    `json:"money"`
+	CreditScore int    `json:"credit_score"`
+	Age         int    `json:"age"`
 }
 
 func (m *AppLoginModule) getUserInfo(cid int64, hashval uint32) *b_user {
@@ -588,11 +652,23 @@ func (m *AppLoginModule) apiGetUserInfo(c *gin.Context) {
 	strcid := c.DefaultQuery("cid", "")
 	cid := int64(0)
 	if len(strcid) == 0 {
-		cid = c.MustGet("userId").(int64)
+		m.ResponesError(c, util.ERRCODE_ERROR, "数据错误")
+		return
 	} else {
 		cid = util.StringToInt64(strcid)
 	}
-	hashval := c.MustGet("phoneHash").(uint32)
+	hashval := uint32(cid)
+	buser := m.getUserInfo(cid, hashval)
+	if buser == nil {
+		c.JSON(http.StatusOK, gin.H{"code": 1, "msg": "没有用户信息"})
+		return
+	}
+	m.ResponesJsonData(c, *buser)
+}
+
+func (m *AppLoginModule) getSelfUserInfo(c *gin.Context) {
+	cid := c.MustGet("userId").(int64)
+	hashval := uint32(cid)
 	buser := m.getUserInfo(cid, hashval)
 	if buser == nil {
 		c.JSON(http.StatusOK, gin.H{"code": 1, "msg": "没有用户信息"})
@@ -658,25 +734,33 @@ func (m *addressInfo) equal(a addressInfo) bool {
 }
 
 type mg_task struct {
-	Id          primitive.ObjectID `json:"id,omitempty" bson:"_id"`
-	CreateAt    string             `json:"createAt,omitempty" bson:"createAt"`
-	UpdateAt    string             `json:"updateAt,omitempty" bson:"updateAt"`
-	Cid         int64              `json:"cid,omitempty" bson:"cid"`
-	CreatorName string             `json:"creator_name,omitempty" bson:"creator_name"`
-	CreatorIcon string             `json:"creator_icon,omitempty" bson:"creator_icon,omitempty"`
-	Title       string             `json:"title" bson:"title"`
-	Content     string             `json:"content" bson:"content"`
-	Images      []string           `json:"images,omitempty" bson:"images,omitempty"`
-	MoneyType   int                `json:"money_type" bson:"money_type"`
-	Money       int                `json:"money" bson:"money"`
-	WomanMoney  int                `json:"womanMoney" bson:"womanMoney"`
-	PeopleNum   int                `json:"people_num" bson:"people_num"`
-	ManNum      int                `json:"man_num" bson:"man_num"`
-	EndTime     int64              `json:"end_time" bson:"end_time"`
-	Address     *addressInfo       `json:"address,omitempty" bson:"address,omitempty"`
-	Delete      int                `json:"delete,omitempty" bson:"delete,omitempty"`
-	Join        *mg_task_join      `json:"join,omitempty" bson:"join,omitempty"`
-	State       int                `json:"state,omitempty" bson:"state,omitempty"`
+	Id            primitive.ObjectID `json:"id,omitempty" bson:"_id"`
+	CreateAt      string             `json:"createAt,omitempty" bson:"createAt"`
+	UpdateAt      string             `json:"updateAt,omitempty" bson:"updateAt"`
+	Cid           int64              `json:"cid,omitempty" bson:"cid"`
+	CreatorName   string             `json:"creator_name,omitempty" bson:"creator_name"`
+	CreatorIcon   string             `json:"creator_icon,omitempty" bson:"creator_icon,omitempty"`
+	Title         string             `json:"title" bson:"title"`
+	Content       string             `json:"content" bson:"content"`
+	Images        []string           `json:"images,omitempty" bson:"images,omitempty"`
+	MoneyType     int                `json:"money_type" bson:"money_type"`
+	Money         int                `json:"money" bson:"money"`
+	WomanMoney    int                `json:"womanMoney" bson:"womanMoney"`
+	PeopleNum     int                `json:"people_num" bson:"people_num"`
+	ManNum        int                `json:"man_num" bson:"man_num"`
+	EndTime       int64              `json:"end_time" bson:"end_time"`
+	TaskStartTime int64              `json:"task_start_time,omitempty" bson:"task_start_time,omitempty"`
+	TaskEndTime   int64              `json:"task_end_time,omitempty" bson:"task_end_time,omitempty"`
+	CreditScore   int                `json:"credit_score,omitempty" bson:"credit_score,omitempty"`
+	NonPublic     int                `json:"nonpublic,omitempty" bson:"nonpublic,omitempty"`
+	Address       *addressInfo       `json:"address,omitempty" bson:"address,omitempty"`
+	Delete        int                `json:"delete,omitempty" bson:"delete,omitempty"`
+	Join          *mg_task_join      `json:"join,omitempty" bson:"join,omitempty"`
+	State         int                `json:"state,omitempty" bson:"state,omitempty"`
+}
+
+func (m *mg_task) isPublic() bool {
+	return m.NonPublic <= 0
 }
 
 // 获取空闲人数
@@ -726,22 +810,23 @@ type mg_task_join_info struct {
 	State  int    `json:"state" bson:"state"`
 	Money  int    `json:"money" bson:"moneye"`
 	NoChat int    `json:"nochat" bson:"nochat"`
+	Time   int64  `json:"time" bson:"time"`
 }
 
 type mg_task_join struct {
-	Id   primitive.ObjectID  `json:"_id" bson:"_id"`
+	Id   primitive.ObjectID  `json:"id" bson:"_id"`
 	Cid  int64               `json:"cid" bson:"cid"`
 	Data []mg_task_join_info `json:"data" bson:"data"`
 }
 
 type My_join_task struct {
-	Id    primitive.ObjectID `json:"_id" bson:"_id"`
+	Id    primitive.ObjectID `json:"id" bson:"_id"`
 	Time  int64              `json:"time" bson:"time"`
 	State int                `json:"state" bson:"state"`
 }
 
 type mg_task_my_join struct {
-	Id       primitive.ObjectID `json:"_id" bson:"_id"`
+	Id       primitive.ObjectID `json:"id" bson:"_id"`
 	Cid      int                `json:"cid" bson:"cid"`
 	TaskList []My_join_task     `json:"tasklist" bson:"tasklist"`
 }
@@ -763,7 +848,7 @@ func checkTaskData(task *mg_task) bool {
 	}
 	titlenum := util.StringCharLen(task.Title)
 	contentnum := util.StringCharLen(task.Content)
-	if titlenum <= 0 || titlenum > 20 || contentnum > 500 {
+	if titlenum <= 0 || titlenum > 30 || contentnum > 500 {
 		util.Log_error("task title:%d content:%d", titlenum, contentnum)
 		return false
 	}
@@ -920,10 +1005,12 @@ func (m *AppLoginModule) apiCreateTask(c *gin.Context) {
 			// 	return nil, err
 			// }
 			task.State = util.TASK_STATE_OPEN
-			err := addToPublic(qc, sessCtx, task)
-			if err != nil {
-				util.Log_error("insert task to public err:%s", err.Error())
-				return nil, err
+			if task.isPublic() {
+				err := addToPublic(qc, sessCtx, task)
+				if err != nil {
+					util.Log_error("insert task to public err:%s", err.Error())
+					return nil, err
+				}
 			}
 
 			coll := qc.Database.Collection(COLL_TASK)
@@ -1042,7 +1129,7 @@ func (m *AppLoginModule) apiUpdateTask(c *gin.Context) {
 			util.Log_error("update task get taskid:%s err:%s", task.Id.Hex(), err.Error())
 			return false
 		}
-		if oldtask == nil || oldtask.State == util.TASK_STATE_FINISH {
+		if oldtask == nil || oldtask.State == util.TASK_STATE_FINISH || oldtask.State == util.TASK_STATE_ILLEGAL {
 			// 已完成不能更新
 			return false
 		}
@@ -1073,10 +1160,12 @@ func (m *AppLoginModule) apiUpdateTask(c *gin.Context) {
 				}
 			}
 			task.State = util.TASK_STATE_OPEN
-			err := addToPublic(qc, sessCtx, task)
-			if err != nil {
-				util.Log_error("insert task to public err:%s", err.Error())
-				return nil, err
+			if task.isPublic() {
+				err := addToPublic(qc, sessCtx, task)
+				if err != nil {
+					util.Log_error("insert task to public err:%s", err.Error())
+					return nil, err
+				}
 			}
 			// 更新 task
 			coll := qc.Database.Collection(COLL_TASK)
@@ -1105,6 +1194,7 @@ type taskGetConfig struct {
 	GlobelMax   int     `json:"globelMax"`
 	LocMax      int     `json:"locMax"`
 	Search      string  `json:"search"`
+	SelectType  int     `json:"select_type"`
 }
 
 type taskResult struct {
@@ -1132,7 +1222,7 @@ func (m *AppLoginModule) apiGetTaskInfo(c *gin.Context) {
 
 	neednum := 20
 	// 区域查找
-	if taskconf.LocMax == 0 {
+	if taskconf.LocMax == 0 && taskconf.SelectType == 0 {
 		location := NewLocation(taskconf.Longitude, taskconf.Latitude)
 		pipline := bson.A{
 			bson.D{
@@ -1202,7 +1292,7 @@ func (m *AppLoginModule) apiGetTaskInfo(c *gin.Context) {
 		}
 	}
 
-	if taskconf.GlobelMax == 0 {
+	if taskconf.GlobelMax == 0 && taskconf.SelectType == 1 {
 		pipline2 := bson.A{
 			bson.M{"$sort": bson.M{"_id": -1}},
 			bson.M{"$skip": taskconf.GlobelLimit},
@@ -1276,7 +1366,7 @@ func (m *AppLoginModule) apiGetOneTaskInfo(c *gin.Context) {
 	hash := util.StringHash(taskid)
 	res := m._mg_mgr.RequestFuncCallHash(hash, func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
 		task, err := getTaskByPipline(qc, ctx, pipline)
-		if err != nil {
+		if err != nil || task.State == util.TASK_STATE_ILLEGAL {
 			return nil
 		}
 		return task
@@ -1294,29 +1384,36 @@ func taskListToTaskPipline(cid int64, skip int, neednum int) bson.A {
 		bson.M{"$project": bson.M{"tasklist": bson.M{"$slice": bson.A{
 			"$tasklist",
 			-skip - neednum,
-			neednum,
-		},
-		},
-		},
-		},
+			neednum},
+		}}},
 		bson.M{"$lookup": bson.D{
 			{Key: "from", Value: "task"},
 			{Key: "localField", Value: "tasklist._id"},
 			{Key: "foreignField", Value: "_id"},
 			{Key: "as", Value: "result"},
-		},
-		},
-		bson.M{"$unwind": "$result"},
-		bson.M{"$replaceRoot": bson.M{"newRoot": "$result"}},
+		}},
+		// bson.M{"$unwind": "$result"},
+		// bson.M{"$replaceRoot": bson.M{"newRoot": "$result"}},
 		bson.M{"$lookup": bson.D{
 			{Key: "from", Value: "task_join"},
-			{Key: "localField", Value: "_id"},
+			{Key: "localField", Value: "tasklist._id"},
 			{Key: "foreignField", Value: "_id"},
-			{Key: "as", Value: "join"},
-		},
-		},
-		bson.M{"$addFields": bson.M{"join": bson.M{"$arrayElemAt": bson.A{"$join", 0}}}},
+			{Key: "as", Value: "task_join"},
+		}},
+		// bson.M{"$addFields": bson.M{"join": bson.M{"$arrayElemAt": bson.A{"$join", 0}}}},
 	}
+}
+
+type loadTaskInfo struct {
+	Tasklist []My_join_task `json:"tasklist" bson:"tasklist"`
+	Result   []mg_task      `json:"result" bson:"result"`
+	TaskJoin []mg_task_join `json:"task_join" bson:"task_join"`
+}
+
+type loadTaskInterest struct {
+	Tasklist []primitive.ObjectID `json:"tasklist" bson:"tasklist"`
+	Result   []mg_task            `json:"result" bson:"result"`
+	TaskJoin []mg_task_join       `json:"task_join" bson:"task_join"`
 }
 
 func (m *AppLoginModule) apiLoadMyTaskInfo(c *gin.Context) {
@@ -1324,6 +1421,60 @@ func (m *AppLoginModule) apiLoadMyTaskInfo(c *gin.Context) {
 	skip := util.StringToInt(c.DefaultQuery("skip", "0"))
 	neednum := 20
 	pipline := taskListToTaskPipline(cid, skip, neednum)
+
+	var loadinfo loadTaskInfo
+
+	m._mg_mgr.RequestFuncCall(func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
+		coll := qc.Database.Collection(COLL_USER_CREATE_TASK)
+		err := coll.Aggregate(ctx, pipline).One(&loadinfo)
+		if err != nil {
+			util.Log_error("load task err:%s", err.Error())
+			return false
+		}
+		return true
+	})
+	m.ResponesJsonData(c, loadinfo)
+}
+
+func (m *AppLoginModule) apiLoadOtherTaskInfo(c *gin.Context) {
+	cid := util.StringToInt64(c.DefaultQuery("cid", "0"))
+	skip := util.StringToInt(c.DefaultQuery("skip", "0"))
+	if cid <= 0 {
+		m.ResponesError(c, 1, "数据错误")
+		return
+	}
+	neednum := 20
+	now := util.GetSecond()
+	pipline := bson.A{
+		bson.M{"$match": bson.M{"cid": cid}},
+		bson.M{"$lookup": bson.D{
+			{Key: "from", Value: "task"},
+			{Key: "localField", Value: "tasklist._id"},
+			{Key: "foreignField", Value: "_id"},
+			{Key: "as", Value: "result"},
+			{Key: "pipeline", Value: bson.A{
+				bson.M{"$match": bson.M{
+					"end_time":  bson.M{"$gt": now},
+					"nonpublic": bson.M{"$ne": 1},
+					"state":     bson.M{"$eq": 1},
+				}},
+			}},
+		}},
+		bson.M{"$project": bson.M{"result": bson.M{"$slice": bson.A{
+			"$result",
+			-skip - neednum,
+			neednum},
+		}}},
+		bson.M{"$unwind": "$result"},
+		bson.M{"$replaceRoot": bson.M{"newRoot": "$result"}},
+		bson.M{"$lookup": bson.D{
+			{Key: "from", Value: "task_join"},
+			{Key: "localField", Value: "_id"},
+			{Key: "foreignField", Value: "_id"},
+			{Key: "as", Value: "join"},
+		}},
+		bson.M{"$addFields": bson.M{"join": bson.M{"$arrayElemAt": bson.A{"$join", 0}}}},
+	}
 
 	var tasks []mg_task
 
@@ -1345,10 +1496,10 @@ func (m *AppLoginModule) apiLoadMyJoinTaskInfo(c *gin.Context) {
 	neednum := 20
 	pipline := taskListToTaskPipline(cid, skip, neednum)
 
-	var tasklist []mg_task
+	var loadinfo loadTaskInfo
 	m._mg_mgr.RequestFuncCall(func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
 		coll := qc.Database.Collection(COLL_USER_TASK)
-		err := coll.Aggregate(ctx, pipline).All(&tasklist)
+		err := coll.Aggregate(ctx, pipline).One(&loadinfo)
 		if err != nil {
 			util.Log_error("load user join task err:%s", err.Error())
 			return false
@@ -1356,7 +1507,7 @@ func (m *AppLoginModule) apiLoadMyJoinTaskInfo(c *gin.Context) {
 		return true
 	})
 
-	m.ResponesJsonData(c, tasklist)
+	m.ResponesJsonData(c, loadinfo)
 }
 
 func (m *AppLoginModule) apiDeleteMyTaskInfo(c *gin.Context) {
@@ -1399,9 +1550,9 @@ func (m *AppLoginModule) apiDeleteMyTaskInfo(c *gin.Context) {
 			// user joinn
 			userjoin := qc.Database.Collection(COLL_USER_TASK)
 			userjoin.UpdateOne(ctx, bson.M{"cid": cid}, bson.M{"$pull": bson.M{"tasklist": bson.M{"_id": objid}}})
-			// task chat
-			chatcoll := qc.Database.Collection(COLL_TASK_CHAT)
-			chatcoll.UpdateOne(ctx, bson.M{"_id": objid}, bson.M{"$set": bson.M{"delete": 1}})
+			// // task chat
+			// chatcoll := qc.Database.Collection(COLL_TASK_CHAT)
+			// chatcoll.UpdateOne(ctx, bson.M{"_id": objid}, bson.M{"$set": bson.M{"delete": 1}})
 		}
 		return err == nil
 	}).(bool)
@@ -1472,6 +1623,10 @@ func (m *AppLoginModule) apiJoinTask(c *gin.Context) {
 				return util.ERRCODE_TASK_HAVE_JOIN
 			}
 		}
+		// 信用分限制
+		if user.CreditScore+CREDIT_SCORE_BASE < task.CreditScore {
+			return util.ERRCODE_CREDIT_SCORE
+		}
 		// 任务以取消
 		if task.Delete > 0 {
 			return util.ERRCODE_TASK_DELETE
@@ -1500,6 +1655,7 @@ func (m *AppLoginModule) apiJoinTask(c *gin.Context) {
 				Name: user.Name,
 				Sex:  user.Sex,
 				Icon: user.Icon,
+				Time: nowsec,
 			}
 			upopts := options.Update().SetUpsert(true)
 			qmopt := qmoption.UpdateOptions{UpdateHook: nil, UpdateOptions: upopts}
@@ -1515,7 +1671,7 @@ func (m *AppLoginModule) apiJoinTask(c *gin.Context) {
 				Time:  nowsec,
 				State: 0,
 			}
-			err = usercoll.UpdateOne(sessCtx, bson.M{"cid": cid}, bson.M{"$push": bson.M{"tasklist": userjoin}}, qmopt)
+			err = usercoll.UpdateOne(sessCtx, bson.M{"cid": cid}, bson.M{"$addToSet": bson.M{"tasklist": userjoin}}, qmopt)
 			if err != nil {
 				util.Log_error("user join err:%s", err.Error())
 				return nil, err
@@ -1693,12 +1849,12 @@ func (m *AppLoginModule) apiKickTask(c *gin.Context) {
 			}
 			// user task join
 			// 被踢
-			usercoll := qc.Database.Collection(COLL_USER_TASK)
-			err = usercoll.UpdateOne(sessCtx, bson.M{"cid": kickcid}, bson.M{"$pull": bson.M{"tasklist": bson.M{"_id": objid}}})
-			if err != nil {
-				util.Log_error("quit user task err:%s", err.Error())
-				return nil, err
-			}
+			// usercoll := qc.Database.Collection(COLL_USER_TASK)
+			// err = usercoll.UpdateOne(sessCtx, bson.M{"cid": kickcid}, bson.M{"$pull": bson.M{"tasklist": bson.M{"_id": objid}}})
+			// if err != nil {
+			// 	util.Log_error("quit user task err:%s", err.Error())
+			// 	return nil, err
+			// }
 			join = task.Join
 			sendres = gin.H{"join": task.Join}
 			return nil, nil
@@ -1708,6 +1864,10 @@ func (m *AppLoginModule) apiKickTask(c *gin.Context) {
 	if res {
 		m.ResponesJsonData(c, sendres)
 		m.updateServerTaskJoin(join)
+		m._server_mod.sendMsg(handle.M_ON_TASK_KICK, &mg_task_join{
+			Id:  *objid,
+			Cid: kickcid,
+		})
 	} else {
 		m.ResponesError(c, util.ERRCODE_ERROR, "踢人失败")
 	}
@@ -1720,7 +1880,7 @@ func (m *AppLoginModule) updateServerTaskJoin(join *mg_task_join) {
 	m._server_mod.sendMsg(handle.M_ON_TASK_JOIN_UPDATE, join)
 }
 
-// 删除并不在接收消息
+// 删除UserJoin
 func (m *AppLoginModule) apiDeleteUserJoin(c *gin.Context) {
 	cid := c.MustGet("userId").(int64)
 	taskid := c.DefaultQuery("taskid", "")
@@ -1742,18 +1902,18 @@ func (m *AppLoginModule) apiDeleteUserJoin(c *gin.Context) {
 			util.Log_error("apiDeleteUserTaskJoin 1 %s", err.Error())
 		}
 		//task join
-		joincoll := qc.Database.Collection(COLL_TASK_JOIN)
-		err = joincoll.UpdateOne(ctx, bson.M{"_id": objid, "data.cid": cid}, bson.M{"$set": bson.M{"data.$.nochat": 1}})
-		if err != nil {
-			util.Log_error("apiDeleteUserTaskJoin 2 %s", err.Error())
-		}
+		// joincoll := qc.Database.Collection(COLL_TASK_JOIN)
+		// err = joincoll.UpdateOne(ctx, bson.M{"_id": objid, "data.cid": cid}, bson.M{"$set": bson.M{"data.$.nochat": 1}})
+		// if err != nil {
+		// 	util.Log_error("apiDeleteUserTaskJoin 2 %s", err.Error())
+		// }
 		return nil
 	})
 	// 通知 client server
-	m._server_mod.sendMsg(handle.M_ON_TASK_NO_CHAT, &mg_task_join{
-		Id:  *objid,
-		Cid: cid,
-	})
+	// m._server_mod.sendMsg(handle.M_ON_TASK_NO_CHAT, &mg_task_join{
+	// 	Id:  *objid,
+	// 	Cid: cid,
+	// })
 	m.ResponesJsonData(c, nil)
 }
 
@@ -2175,19 +2335,28 @@ func (m *AppLoginModule) apiEditSex(c *gin.Context) {
 }
 
 type mg_report_task struct {
-	Submitcid int64    `json:"submitcid,omitempty" bson:"submitcid"`
-	Taskid    string   `json:"taskid" bson:"taskid"`
-	Type      int      `json:"type" bson:"type"`
-	Content   string   `json:"content" bson:"content"`
-	Images    []string `json:"images" bson:"images"`
+	Id        primitive.ObjectID `json:"id,omitempty" bson:"_id"`
+	Submitcid int64              `json:"submitcid,omitempty" bson:"submitcid"`
+	Taskid    string             `json:"taskid" bson:"taskid"`
+	Type      int                `json:"type" bson:"type"`
+	Content   string             `json:"content" bson:"content"`
+	Images    []string           `json:"images" bson:"images"`
 }
 
 type mg_report_user struct {
-	Submitcid int64    `json:"submitcid,omitempty" bson:"submitcid"`
-	Cid       int64    `json:"cid" bson:"cid"`
-	Type      int      `json:"type" bson:"type"`
-	Content   string   `json:"content" bson:"content"`
-	Images    []string `json:"images" bson:"images"`
+	Id        primitive.ObjectID `json:"id,omitempty" bson:"_id"`
+	Submitcid int64              `json:"submitcid,omitempty" bson:"submitcid"`
+	Cid       int64              `json:"cid" bson:"cid"`
+	Type      int                `json:"type" bson:"type"`
+	Content   string             `json:"content" bson:"content"`
+	Images    []string           `json:"images" bson:"images"`
+}
+
+type mg_suggest struct {
+	Id      primitive.ObjectID `json:"id,omitempty" bson:"_id"`
+	Cid     int64              `json:"cid,omitempty" bson:"cid"`
+	Content string             `json:"content" bson:"content"`
+	Images  []string           `json:"images" bson:"images"`
 }
 
 func (m *AppLoginModule) apiReportTask(c *gin.Context) {
@@ -2241,6 +2410,32 @@ func (m *AppLoginModule) apiReportUser(c *gin.Context) {
 		_, err := coll.InsertOne(ctx, rep)
 		if err != nil {
 			util.Log_error("apiReportUser err:%s", err.Error())
+		}
+	})
+	m.ResponesJsonData(c, nil)
+}
+
+func (m *AppLoginModule) apiUserSuggest(c *gin.Context) {
+	var rep mg_suggest
+	err := c.ShouldBindJSON(&rep)
+	if err != nil {
+		util.Log_error("apiUserSuggest json error:%s", err.Error())
+		m.ResponesError(c, 1, "输入数据错误")
+		return
+	}
+
+	if len(rep.Images) > 3 {
+		util.Log_error("apiUserSuggest images len:%d", len(rep.Images))
+		m.ResponesError(c, 1, "输入数据错误")
+		return
+	}
+
+	// 存入mgdb
+	m._mg_mgr.RequestFuncCallNoRes(func(ctx context.Context, qc *qmgo.QmgoClient) {
+		coll := qc.Database.Collection(COLL_SUGGEST)
+		_, err := coll.InsertOne(ctx, rep)
+		if err != nil {
+			util.Log_error("apiUserSuggest err:%s", err.Error())
 		}
 	})
 	m.ResponesJsonData(c, nil)
@@ -2515,29 +2710,29 @@ func (m *AppLoginModule) apiLoadInterestTask(c *gin.Context) {
 			{Key: "as", Value: "result"},
 		},
 		},
-		bson.M{"$unwind": "$result"},
-		bson.M{"$replaceRoot": bson.M{"newRoot": "$result"}},
+		// bson.M{"$unwind": "$result"},
+		// bson.M{"$replaceRoot": bson.M{"newRoot": "$result"}},
 		bson.M{"$lookup": bson.D{
 			{Key: "from", Value: "task_join"},
-			{Key: "localField", Value: "_id"},
+			{Key: "localField", Value: "tasklist"},
 			{Key: "foreignField", Value: "_id"},
-			{Key: "as", Value: "join"},
+			{Key: "as", Value: "task_join"},
 		},
 		},
-		bson.M{"$addFields": bson.M{"join": bson.M{"$arrayElemAt": bson.A{"$join", 0}}}},
+		// bson.M{"$addFields": bson.M{"join": bson.M{"$arrayElemAt": bson.A{"$join", 0}}}},
 	}
 
-	var tasklist []mg_task
+	var loadinfo loadTaskInterest
 	m._mg_mgr.RequestFuncCall(func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
 		coll := qc.Database.Collection(COLL_USER_INTEREST)
-		err := coll.Aggregate(ctx, pipline).All(&tasklist)
+		err := coll.Aggregate(ctx, pipline).One(&loadinfo)
 		if err != nil {
 			util.Log_error("load interest task err:%s", err.Error())
 			return false
 		}
 		return true
 	})
-	m.ResponesJsonData(c, tasklist)
+	m.ResponesJsonData(c, loadinfo)
 }
 
 func (m *AppLoginModule) apiSetUserIcon(c *gin.Context) {
@@ -2564,8 +2759,9 @@ func (m *AppLoginModule) apiSetUserIcon(c *gin.Context) {
 }
 
 type mg_app_crash struct {
-	Id    primitive.ObjectID `json:"_id" bson:"_id"`
+	Id    primitive.ObjectID `json:"_id,omitempty" bson:"_id"`
 	Crash string             `json:"crash" bson:"crash"`
+	Time  int64              `json:"time,omitempty" bson:"time"`
 }
 
 func (m *AppLoginModule) apiAppCrash(c *gin.Context) {
@@ -2574,7 +2770,34 @@ func (m *AppLoginModule) apiAppCrash(c *gin.Context) {
 	crash := mg_app_crash{
 		Id:    qmgo.NewObjectID(),
 		Crash: info,
+		Time:  util.GetSecond(),
 	}
+
+	m._mg_mgr.RequestFuncCallNoRes(func(ctx context.Context, qc *qmgo.QmgoClient) {
+		coll := qc.Database.Collection(COLL_APP_CRASH)
+		_, err := coll.InsertOne(ctx, crash)
+		if err != nil {
+			util.Log_error(err.Error())
+		}
+	})
+}
+
+func (m *AppLoginModule) apiAppError(c *gin.Context) {
+	// info := c.PostForm("error")
+	// info, err := c.GetRawData()
+	var crash mg_app_crash
+	err := c.ShouldBindJSON(&crash)
+	if err != nil {
+		util.Log_error("apiAppError:%s", err.Error())
+		return
+	}
+
+	crash.Id = qmgo.NewObjectID()
+	crash.Time = util.GetSecond()
+	// crash := mg_app_crash{
+	// 	Id:    ,
+	// 	Crash: string(info),
+	// }
 
 	m._mg_mgr.RequestFuncCallNoRes(func(ctx context.Context, qc *qmgo.QmgoClient) {
 		coll := qc.Database.Collection(COLL_APP_CRASH)
@@ -2716,6 +2939,41 @@ func (m *AppLoginModule) apiLoadUserChatData(c *gin.Context) {
 	m.ResponesJsonData(c, chatlist)
 }
 
+func (m *AppLoginModule) apiLoadOneUserChatData(c *gin.Context) {
+	tocid := util.StringToInt64(c.DefaultQuery("cid", "0"))
+	cid := c.MustGet("userId").(int64)
+	if tocid <= 0 {
+		m.ResponesJsonData(c, nil)
+		return
+	}
+
+	cidhei := tocid
+	cidlow := cid
+	if cid > tocid {
+		cidhei = cid
+		cidlow = tocid
+	}
+
+	pip := bson.A{
+		bson.M{"$match": bson.M{"cidhei": cidhei, "cidlow": cidlow}},
+		bson.M{"$addFields": bson.M{"data": bson.M{"$slice": bson.A{
+			"$data",
+			-20,
+			20,
+		}},
+		}}}
+	var chatlist mg_chat_user_list
+	err := m._mg_mgr.RequestFuncCall(func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
+		coll := qc.Database.Collection(COLL_CHAT_USER_LIST)
+		err := coll.Aggregate(ctx, pip).One(&chatlist)
+		return err
+	})
+	if err != nil {
+		util.Log_error("apiLoadUserChatData err: %s", err.(error).Error())
+	}
+	m.ResponesJsonData(c, chatlist)
+}
+
 func (m *AppLoginModule) apiDeleteUserChatData(c *gin.Context) {
 	cid := c.MustGet("userId").(int64)
 	id := c.DefaultQuery("id", "")
@@ -2731,6 +2989,143 @@ func (m *AppLoginModule) apiDeleteUserChatData(c *gin.Context) {
 	m._mg_mgr.RequestFuncCallNoRes(func(ctx context.Context, qc *qmgo.QmgoClient) {
 		coll := qc.Database.Collection(COLL_CHAT_USER_LIST)
 		coll.UpdateOne(ctx, bson.M{"_id": objid}, bson.M{"$addToSet": bson.M{"delete": cid}}, qmopt)
+	})
+	m.ResponesJsonData(c, nil)
+}
+
+type b_user_credit_judge struct {
+	Cid     int64 `gorm:"primaryKey" json:"cid"`
+	FromCid int64 `gorm:"primaryKey;column:fromcid" json:"fromcid"`
+	Ctype   int   `json:"ctype"`
+	Time    int64 `json:"time"`
+}
+
+// 获取对某个用户的评价类型
+func (m *AppLoginModule) apiGetCreditToUserType(c *gin.Context) {
+	cid := c.MustGet("userId").(int64)
+	tocid := util.StringToInt64(c.DefaultQuery("cid", "0"))
+	if tocid <= 0 {
+		m.ResponesError(c, 1, "输入数据错误")
+		return
+	}
+
+	var bcredit b_user_credit_judge
+	m._sql_mgr.RequestFuncCallHash(uint32(tocid), func(d *gorm.DB) interface{} {
+		res := d.Table("b_user_credit_judge").Find(&bcredit, "cid = ? AND fromcid = ?", tocid, cid)
+		if res.Error != nil {
+			util.Log_error("get credit to user sql err:%s", res.Error.Error())
+		}
+		return nil
+	})
+	m.ResponesJsonData(c, bcredit)
+}
+
+// 评价某个用户
+func (m *AppLoginModule) apiSetCreditToUserType(c *gin.Context) {
+	cid := c.MustGet("userId").(int64)
+	tocid := util.StringToInt64(c.DefaultQuery("cid", "0"))
+	ctype := util.StringToInt(c.DefaultQuery("type", "0"))
+	if tocid <= 0 || ctype < -1 || ctype > 1 {
+		m.ResponesError(c, 1, "输入数据错误")
+		return
+	}
+
+	now := util.GetSecond()
+	m._sql_mgr.RequestFuncCallNoResHash(uint32(tocid), func(d *gorm.DB) { //interface{}
+		// 事务
+		var bcredit b_user_credit_judge
+		res := d.Table("b_user_credit_judge").Find(&bcredit, "cid = ? AND fromcid = ?", tocid, cid)
+		if res.Error != nil {
+			util.Log_error("set credit type sql err1:%s", res.Error.Error())
+		}
+		if bcredit.Ctype == int(ctype) {
+			return
+		}
+		// new - old
+		score := ctype - bcredit.Ctype
+		d.Transaction(func(tx *gorm.DB) error {
+			var res *gorm.DB
+			if ctype == 0 {
+				res = d.Exec("DELETE from `b_user_credit_judge` WHERE `cid`=? AND `fromcid`=?;", tocid, cid)
+			} else {
+				res = d.Exec("INSERT INTO `b_user_credit_judge` VALUES(?,?,?,?) ON DUPLICATE KEY UPDATE `ctype`=?,`time`=?;", tocid, cid, ctype, now, ctype, now)
+			}
+			if res.Error != nil {
+				util.Log_error("update b_user_credit_judge err: %s", res.Error.Error())
+				return res.Error
+			}
+
+			res = tx.Model(&b_user{Cid: tocid}).Update("credit_score", gorm.Expr("credit_score + ?", score))
+			if res.Error != nil {
+				util.Log_error("set credit type sql err2: %s", res.Error.Error())
+				return res.Error
+			}
+			return nil
+		})
+		// return nil
+	})
+	m.ResponesJsonData(c, nil)
+}
+
+type b_user_idcard struct {
+	Cid    int64  `gorm:"primaryKey" json:"cid"`
+	IdCard string `gorm:"primaryKey;column:id_card"`
+	Name   string
+}
+
+func getAgeFromID(id string) int {
+	birthday := id[6:14] // 从身份证号码中截取出生日期部分
+	year, _ := strconv.Atoi(birthday[0:4])
+	month, _ := strconv.Atoi(birthday[4:6])
+	day, _ := strconv.Atoi(birthday[6:8])
+
+	today := time.Now()
+	birthDate := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
+
+	age := today.Year() - birthDate.Year()
+
+	// 如果生日大于当前日期的生日，则年龄减1
+	if today.Month() < birthDate.Month() || (today.Month() == birthDate.Month() && today.Day() < birthDate.Day()) {
+		age--
+	}
+	return age
+}
+
+func getGender(idNumber string) int {
+	// 通过身份证号的倒数第二位数字判断性别，偶数为女性，奇数为男性
+	genderDigit, _ := strconv.Atoi(string(idNumber[len(idNumber)-2]))
+	if genderDigit%2 == 0 {
+		return util.SEX_WOMAN
+	} else {
+		return util.SEX_MAN
+	}
+}
+
+// 实名验证
+func (m *AppLoginModule) apiCheckIdCard(c *gin.Context) {
+	cid := c.MustGet("userId").(int64)
+	idcard := c.DefaultQuery("idcard", "")
+	name := c.DefaultQuery("name", "")
+
+	if len(idcard) == 0 || len(name) == 0 {
+		m.ResponesError(c, 1, "输入数据错误")
+		return
+	}
+	// 验证
+
+	// 入库
+	age := getAgeFromID(idcard)
+	sex := getGender(idcard)
+	m._sql_mgr.RequestFuncCallNoResHash(uint32(cid), func(d *gorm.DB) {
+		res := d.Table("b_user_idcard").Create(&b_user_idcard{Cid: cid, IdCard: idcard, Name: name})
+		if res.Error != nil {
+			util.Log_error("insert idcard err:%s", res.Error.Error())
+		}
+		// age,sex
+		res = d.Model(&b_user{Cid: cid}).Updates(map[string]interface{}{"age": age, "sex": sex})
+		if res.Error != nil {
+			util.Log_error("update user age err:%s", res.Error.Error())
+		}
 	})
 	m.ResponesJsonData(c, nil)
 }

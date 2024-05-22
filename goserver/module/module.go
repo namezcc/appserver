@@ -33,7 +33,7 @@ type modulebase struct {
 	_msg_chan chan *handle.BaseMsg
 }
 
-var defalut_msg_size int = 100
+var defalut_msg_size int = 1000
 
 func (m *modulebase) InitMsgSize(s int) {
 	m._msg_chan = make(chan *handle.BaseMsg, s)
