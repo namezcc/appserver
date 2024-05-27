@@ -231,7 +231,7 @@ func (m *AppLoginModule) Init(mgr *moduleMgr) {
 	m.SetHost(":" + util.GetConfValue("hostport"))
 	m.SetMysqlHots("")
 	m._safe_req = make(map[string]bool)
-	m._redis_mgr = mgr.GetModule(MOD_REDIS_MGR).(*RedisManagerModule)
+	// m._redis_mgr = mgr.GetModule(MOD_REDIS_MGR).(*RedisManagerModule)
 	m._sql_mgr = mgr.GetModule(MOD_MYSQL_MGR).(*MysqlManagerModule)
 	m._mg_mgr = mgr.GetModule(MOD_MONGO_MGR).(*MongoManagerModule)
 	m._server_mod = mgr.GetModule(MOD_CLIENT_SERVER).(*ClientServerModule)
@@ -296,6 +296,18 @@ func (m *AppLoginModule) initRoter(r *gin.Engine) {
 	}
 	// absPath, _ := filepath.Abs(path) // 转换为绝对路径
 	r.Static("/static", path+"/upload")
+	// r.StaticFS("/web", http.Dir("./view/"))
+	// r.GET("/web/*filepath", func(c *gin.Context) {
+	// 	c.Writer.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// 	c.File(c.FullPath())
+	// })
+
+	wg := r.Group("/web")
+	wg.Use(func(ctx *gin.Context) {
+		ctx.Writer.Header().Set("Content-Type", "text/html; charset=utf-8")
+		ctx.Next()
+	})
+	wg.StaticFS("/", http.Dir("./view/"))
 
 	r.Use(m.getMiddlew())
 
@@ -329,6 +341,7 @@ func (m *AppLoginModule) initRoter(r *gin.Engine) {
 	r.GET("/apiDeleteUserJoin", m.apiDeleteUserJoin)
 
 	r.POST("/apiFinishTask", m.apiFinishTask)
+	r.GET("/apiSetFinishTask", m.apiSetFinishTask)
 	r.GET("/apiGetTaskReward", m.apiGetTaskReward)
 	r.GET("/apiPayTaskCost", m.apiPayTaskCost)
 	r.GET("/apiGetTaskCost", m.apiGetTaskCost)
@@ -367,6 +380,8 @@ func (m *AppLoginModule) initRoter(r *gin.Engine) {
 	r.GET("/apiGetCreditToUserType", m.apiGetCreditToUserType)
 	r.GET("/apiSetCreditToUserType", m.apiSetCreditToUserType)
 	r.GET("/apiCheckIdCard", m.apiCheckIdCard)
+	r.GET("/apiGetOssCredential", m.apiGetOssCredential)
+	m.safeGet(r, "/apiGetPostPolicy", m.apiGetPostPolicy)
 }
 
 const UID_START_TIME = 1675612800
@@ -631,6 +646,7 @@ type b_user struct {
 	Money       int    `json:"money"`
 	CreditScore int    `json:"credit_score"`
 	Age         int    `json:"age"`
+	Weixin      string `json:"weixin"`
 }
 
 func (m *AppLoginModule) getUserInfo(cid int64, hashval uint32) *b_user {
@@ -748,6 +764,7 @@ type mg_task struct {
 	WomanMoney    int                `json:"womanMoney" bson:"womanMoney"`
 	PeopleNum     int                `json:"people_num" bson:"people_num"`
 	ManNum        int                `json:"man_num" bson:"man_num"`
+	ContactWay    string             `json:"contact_way,omitempty" bson:"contact_way,omitempty"`
 	EndTime       int64              `json:"end_time" bson:"end_time"`
 	TaskStartTime int64              `json:"task_start_time,omitempty" bson:"task_start_time,omitempty"`
 	TaskEndTime   int64              `json:"task_end_time,omitempty" bson:"task_end_time,omitempty"`
@@ -850,6 +867,11 @@ func checkTaskData(task *mg_task) bool {
 	contentnum := util.StringCharLen(task.Content)
 	if titlenum <= 0 || titlenum > 30 || contentnum > 500 {
 		util.Log_error("task title:%d content:%d", titlenum, contentnum)
+		return false
+	}
+
+	if util.StringCharLen(task.ContactWay) > 30 {
+		util.Log_error("task maxlen contactway:%d", util.StringCharLen(task.ContactWay))
 		return false
 	}
 	return true
@@ -1040,6 +1062,8 @@ func (m *AppLoginModule) apiCreateTask(c *gin.Context) {
 
 	if ires {
 		m.ResponesJsonData(c, task)
+		// 检查违规
+		m.checkTask(&task)
 	} else {
 		m.ResponesError(c, 1, "创建task错误")
 	}
@@ -1180,6 +1204,8 @@ func (m *AppLoginModule) apiUpdateTask(c *gin.Context) {
 	}).(bool)
 	if tres {
 		m.ResponesJsonData(c, task)
+		// 检查违规
+		m.checkTask(&task)
 	} else {
 		m.ResponesError(c, 1, "更新失败")
 	}
@@ -2051,6 +2077,51 @@ func (m *AppLoginModule) apiFinishTask(c *gin.Context) {
 	}
 }
 
+// 设置完成任务状态
+func (m *AppLoginModule) apiSetFinishTask(c *gin.Context) {
+	cid := c.MustGet("userId").(int64)
+	taskid := c.DefaultQuery("taskid", "")
+	if taskid == "" {
+		m.ResponesError(c, 1, "数据错误")
+		return
+	}
+	objid := stringToObjectId(taskid)
+	if objid == nil {
+		m.ResponesError(c, 1, "数据错误")
+		return
+	}
+
+	hash := util.StringHash(taskid)
+	m._mg_mgr.RequestFuncCallHash(hash, func(ctx context.Context, qc *qmgo.QmgoClient) interface{} {
+		task, err := getTaskInfoByQmgo(qc, ctx, *objid)
+		if err != nil {
+			util.Log_error("apiSetFinishTask step 1 err:%s", err.Error())
+			return false
+		}
+
+		if task.State != util.TASK_STATE_OPEN || task.Cid != cid {
+			return false
+		}
+
+		coll := qc.Database.Collection(COLL_TASK)
+		err = coll.UpdateOne(ctx, bson.M{"_id": objid}, bson.M{"$set": bson.M{"state": util.TASK_STATE_FINISH}})
+		if err != nil {
+			util.Log_error("apiSetFinishTask step 2 err:%s", err.Error())
+			return false
+		}
+		// 删除global,location
+		loc_coll := qc.Database.Collection(COLL_TASK_LOCATION)
+		glo_coll := qc.Database.Collection(COLL_TASK_GLOBEL)
+		// 删除 location
+		loc_coll.RemoveId(ctx, objid)
+		// 删除 globel
+		glo_coll.RemoveId(ctx, objid)
+		return true
+	})
+
+	m.ResponesJsonData(c, nil)
+}
+
 // 玩家领取任务奖励
 func (m *AppLoginModule) apiGetTaskReward(c *gin.Context) {
 	cid := c.MustGet("userId").(int64)
@@ -2290,7 +2361,7 @@ func (m *AppLoginModule) apiEditName(c *gin.Context) {
 	cid := c.MustGet("userId").(int64)
 	name := c.DefaultQuery("name", "")
 	namelen := util.StringCharLen(name)
-	if name == "" || namelen < 2 || namelen > 15 {
+	if name == "" || namelen < 1 || namelen > 15 {
 		m.ResponesError(c, util.ERRCODE_ERROR, "昵称不符合规范")
 		return
 	}
@@ -2376,6 +2447,7 @@ func (m *AppLoginModule) apiReportTask(c *gin.Context) {
 	}
 
 	reptask.Submitcid = cid
+	reptask.Id = qmgo.NewObjectID()
 	// 存入mgdb
 	m._mg_mgr.RequestFuncCallNoRes(func(ctx context.Context, qc *qmgo.QmgoClient) {
 		coll := qc.Database.Collection(COLL_REPORT_TASK)
@@ -2403,6 +2475,7 @@ func (m *AppLoginModule) apiReportUser(c *gin.Context) {
 		return
 	}
 
+	rep.Id = qmgo.NewObjectID()
 	rep.Submitcid = cid
 	// 存入mgdb
 	m._mg_mgr.RequestFuncCallNoRes(func(ctx context.Context, qc *qmgo.QmgoClient) {
@@ -2430,6 +2503,7 @@ func (m *AppLoginModule) apiUserSuggest(c *gin.Context) {
 		return
 	}
 
+	rep.Id = qmgo.NewObjectID()
 	// 存入mgdb
 	m._mg_mgr.RequestFuncCallNoRes(func(ctx context.Context, qc *qmgo.QmgoClient) {
 		coll := qc.Database.Collection(COLL_SUGGEST)
@@ -3128,4 +3202,67 @@ func (m *AppLoginModule) apiCheckIdCard(c *gin.Context) {
 		}
 	})
 	m.ResponesJsonData(c, nil)
+}
+
+func (m *AppLoginModule) apiGetOssCredential(c *gin.Context) {
+	url := util.GetConfValue("nodeServerHost") + "getOssCredential"
+	resp, err := http.DefaultClient.Get(url)
+	if err != nil {
+		util.Log_error("apiGetOssCredential step 1 err:%s", err.Error())
+		ResponesCommonError(c, "服务器错误")
+		return
+	}
+
+	msg, err := io.ReadAll(resp.Body)
+	if err != nil {
+		util.Log_error("apiGetOssCredential step 2 err:%s", err.Error())
+		ResponesCommonError(c, "服务器错误")
+		return
+	}
+	c.String(http.StatusOK, string(msg))
+}
+
+func (m *AppLoginModule) apiGetPostPolicy(c *gin.Context) {
+	ext := c.DefaultQuery("ext", "")
+	if len(ext) == 0 {
+		ResponesCommonError(c, "参数错误")
+		return
+	}
+	url := util.GetConfValue("nodeServerHost") + "getPostPolicy?ext=" + ext
+	resp, err := http.DefaultClient.Get(url)
+	if err != nil {
+		util.Log_error("apiGetPostPolicy step 1 err:%s", err.Error())
+		ResponesCommonError(c, "服务器错误")
+		return
+	}
+
+	msg, err := io.ReadAll(resp.Body)
+	if err != nil {
+		util.Log_error("apiGetPostPolicy step 2 err:%s", err.Error())
+		ResponesCommonError(c, "服务器错误")
+		return
+	}
+	c.String(http.StatusOK, string(msg))
+}
+
+func (m *AppLoginModule) checkTask(task *mg_task) {
+	go func() {
+		url := util.GetConfValue("nodeServerHost") + "checkTask"
+		pdata, err := json.Marshal(task)
+		if err != nil {
+			util.Log_error("checkTask step 1 err:%s", err.Error())
+			return
+		}
+
+		req, err := http.NewRequest("POST", url, bytes.NewReader(pdata))
+		if err != nil {
+			util.Log_error("checkTask step 2 err:%s", err.Error())
+			return
+		}
+		req.Header.Set("Content-Type", "application/json; charset=utf-8")
+		_, err = http.DefaultClient.Do(req)
+		if err != nil {
+			util.Log_error("checkTask step 3 err:%s", err.Error())
+		}
+	}()
 }

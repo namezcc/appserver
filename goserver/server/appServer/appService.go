@@ -21,7 +21,7 @@ func main() {
 	module.ModuleMgr.InitMsg(handle.MS_BEGIN, handle.MS_END)
 
 	module.ModuleMgr.AddModule(module.MOD_HTTP, &module.AppLoginModule{})
-	module.ModuleMgr.AddModule(module.MOD_REDIS_MGR, &module.RedisManagerModule{})
+	// module.ModuleMgr.AddModule(module.MOD_REDIS_MGR, &module.RedisManagerModule{})
 	module.ModuleMgr.AddModule(module.MOD_MYSQL_MGR, &module.MysqlManagerModule{
 		HostKey: "mysql",
 	})

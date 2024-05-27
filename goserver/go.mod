@@ -5,6 +5,7 @@ go 1.19
 require (
 	github.com/dgrijalva/jwt-go v3.2.0+incompatible
 	github.com/gin-gonic/gin v1.7.1
+	github.com/go-ego/gse v0.80.2
 	github.com/go-redis/redis/v8 v8.11.5
 	github.com/go-sql-driver/mysql v1.7.1
 	github.com/golang/protobuf v1.5.2
@@ -17,9 +18,13 @@ require (
 )
 
 require (
-	github.com/go-ego/gse v0.80.2 // indirect
+	github.com/clbanning/mxj v1.8.4 // indirect
 	github.com/gobwas/httphead v0.1.0 // indirect
 	github.com/gobwas/pool v0.2.1 // indirect
+	github.com/google/go-querystring v1.1.0 // indirect
+	github.com/mitchellh/mapstructure v1.5.0 // indirect
+	github.com/mozillazg/go-httpheader v0.4.0 // indirect
+	github.com/tencentyun/cos-go-sdk-v5 v0.7.48 // indirect
 	github.com/vcaesar/cedar v0.20.1 // indirect
 )
 
@@ -42,6 +47,7 @@ require (
 	github.com/modern-go/concurrent v0.0.0-20180228061459-e0a39a4cb421 // indirect
 	github.com/modern-go/reflect2 v0.0.0-20180701023420-4b7aa43c6742 // indirect
 	github.com/montanaflynn/stats v0.7.1 // indirect
+	github.com/tencentyun/qcloud-cos-sts-sdk v0.0.0-20240307081512-0195d273fdb5
 	github.com/ugorji/go/codec v1.1.7 // indirect
 	github.com/xdg-go/pbkdf2 v1.0.0 // indirect
 	github.com/xdg-go/scram v1.1.2 // indirect
